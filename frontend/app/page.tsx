@@ -34,6 +34,8 @@ export default function DashboardPage() {
   const [githubRepos, setGithubRepos] = useState<GithubRepo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [connectingRepo, setConnectingRepo] = useState<string | null>(null);
+  const [indexingRepoId, setIndexingRepoId] = useState<number | null>(null);
+  const [indexMessage, setIndexMessage] = useState<string | null>(null);
   const [dataUnreachable, setDataUnreachable] = useState(false);
 
   useEffect(() => {
@@ -96,6 +98,30 @@ export default function DashboardPage() {
     }
   }
 
+  async function indexRepo(repo: Repository) {
+    setIndexingRepoId(repo.id);
+    setIndexMessage(null);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/${repo.id}/index`, {
+        ...fetchOpts,
+        method: "POST",
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(body.detail ?? `Backend responded with ${res.status}`);
+      }
+      setIndexMessage(
+        `${repo.name}: indexed ${body.files_indexed} files, found ${body.symbols_found} symbols and ${body.calls_found} calls.`
+      );
+      await loadRepositories();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to index repository");
+    } finally {
+      setIndexingRepoId(null);
+    }
+  }
+
   async function handleLogout() {
     await logout();
     router.replace("/login");
@@ -149,6 +175,11 @@ export default function DashboardPage() {
         )}
 
         {error && <p className="mt-6 text-sm text-red-600">{error}</p>}
+        {indexMessage && (
+          <p className="mt-6 rounded border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">
+            {indexMessage}
+          </p>
+        )}
 
         <div className="mt-10">
           <h2 className="text-lg font-medium text-black dark:text-zinc-50">
@@ -158,22 +189,36 @@ export default function DashboardPage() {
             <p className="mt-2 text-zinc-500">None connected yet, pick one below.</p>
           ) : (
             <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-              {repositories.map((repo) => (
-                <div
-                  key={repo.id}
-                  className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="truncate font-medium text-black dark:text-zinc-50">
-                      {repo.name}
+              {repositories.map((repo) => {
+                const indexing = indexingRepoId === repo.id;
+                return (
+                  <div
+                    key={repo.id}
+                    className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="truncate font-medium text-black dark:text-zinc-50">
+                        {repo.name}
+                      </p>
+                      <StatusPill status={indexing ? "indexing" : repo.index_status} />
+                    </div>
+                    <p className="mt-1 text-xs text-zinc-400">
+                      Default branch: {repo.default_branch}
                     </p>
-                    <StatusPill status={repo.index_status} />
+                    <button
+                      disabled={indexing}
+                      onClick={() => indexRepo(repo)}
+                      className="mt-3 w-full rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-black transition disabled:opacity-50 dark:border-zinc-700 dark:text-white"
+                    >
+                      {indexing
+                        ? "Indexing..."
+                        : repo.index_status === "indexed"
+                          ? "Re-index"
+                          : "Index"}
+                    </button>
                   </div>
-                  <p className="mt-1 text-xs text-zinc-400">
-                    Default branch: {repo.default_branch}
-                  </p>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

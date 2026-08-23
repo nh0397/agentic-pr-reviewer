@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.api.routes import auth, github, health, indexing, repositories
+from app.api.routes import auth, github, health, indexing, pull_requests, repositories
 from app.config import get_settings
 from app.db.session import engine
 from app.indexing.queue import worker_loop
@@ -72,3 +72,4 @@ app.include_router(auth.router)
 app.include_router(github.router)
 app.include_router(repositories.router)
 app.include_router(indexing.router)
+app.include_router(pull_requests.router)

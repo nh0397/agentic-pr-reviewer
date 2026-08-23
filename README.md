@@ -68,14 +68,10 @@ npm run dev
 
 Open http://localhost:3000.
 
-## Running the backend in Docker instead
-
-Mirrors how it is deployed, and is the slower path since it rebuilds the
-image. Not needed for day to day development.
-
-```bash
-docker compose --profile full up -d --build
-```
+Docker Compose runs Postgres and Qdrant only. The backend is not a Compose
+service: running it locally means no image to rebuild on every code change,
+and only one copy of it to keep track of. `backend/Dockerfile` is what
+builds it for deployment.
 
 ## Not built yet
 

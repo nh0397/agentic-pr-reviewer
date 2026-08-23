@@ -1,3 +1,6 @@
+# Infrastructure only. The backend runs locally with `uvicorn --reload`
+# against these published ports, so there is one way to run it and no image
+# to rebuild on every code change. Deployment uses backend/Dockerfile.
 services:
   postgres:
     image: postgres:16-alpine
@@ -24,31 +27,6 @@ services:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
-
-  # The backend deliberately does NOT run here by default. Compose provides
-  # infrastructure only; the backend runs locally with `uvicorn --reload`
-  # against these published ports. One way to run it means no second copy
-  # to keep in sync and no stale image serving old code.
-  #
-  # `docker compose --profile full up -d` runs it in a container instead,
-  # which is the path that mirrors deployment.
-  backend:
-    profiles: ["full"]
-    build: ./backend
-    env_file:
-      - ./backend/.env
-    environment:
-      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/pr_reviewer
-      QDRANT_URL: http://qdrant:6333
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./backend:/app
-    depends_on:
-      postgres:
-        condition: service_healthy
-    command: >
-      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 
 volumes:
   postgres_data:

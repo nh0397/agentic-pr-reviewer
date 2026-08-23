@@ -12,7 +12,12 @@ COLLECTION_NAME = "code_symbols"
 @lru_cache
 def get_qdrant_client() -> QdrantClient:
     settings = get_settings()
-    return QdrantClient(url=settings.qdrant_url or "http://localhost:6333", api_key=settings.qdrant_api_key)
+    return QdrantClient(
+        url=settings.qdrant_url or "http://localhost:6333",
+        # An unset key arrives as "" from the env file; passing that through
+        # makes the client think a real key was supplied over plain HTTP.
+        api_key=settings.qdrant_api_key or None,
+    )
 
 
 def ensure_collection() -> None:

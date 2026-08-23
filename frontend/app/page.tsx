@@ -40,24 +40,36 @@ export default function Home() {
   const [githubRepos, setGithubRepos] = useState<GithubRepo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [connectingRepo, setConnectingRepo] = useState<string | null>(null);
+  const [backendUnreachable, setBackendUnreachable] = useState(false);
 
   async function loadSession() {
     try {
       const res = await fetch(`${API_BASE_URL}/api/auth/me`, fetchOpts);
       setUser(res.ok ? await res.json() : null);
+      setBackendUnreachable(false);
+    } catch {
+      setBackendUnreachable(true);
     } finally {
       setCheckingSession(false);
     }
   }
 
   async function loadRepositories() {
-    const res = await fetch(`${API_BASE_URL}/api/repositories`, fetchOpts);
-    if (res.ok) setRepositories(await res.json());
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/repositories`, fetchOpts);
+      if (res.ok) setRepositories(await res.json());
+    } catch {
+      setBackendUnreachable(true);
+    }
   }
 
   async function loadGithubRepos() {
-    const res = await fetch(`${API_BASE_URL}/api/github/repos`, fetchOpts);
-    if (res.ok) setGithubRepos(await res.json());
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/github/repos`, fetchOpts);
+      if (res.ok) setGithubRepos(await res.json());
+    } catch {
+      setBackendUnreachable(true);
+    }
   }
 
   useEffect(() => {
@@ -130,6 +142,13 @@ export default function Home() {
             </div>
           )}
         </div>
+
+        {backendUnreachable && (
+          <p className="mt-6 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
+            Could not reach the backend at {API_BASE_URL}. Make sure it is running
+            (<code>docker compose up -d --build</code> from the project root).
+          </p>
+        )}
 
         {checkingSession ? (
           <p className="mt-10 text-zinc-500">Checking session...</p>

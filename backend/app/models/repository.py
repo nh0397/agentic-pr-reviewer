@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, String, func
+from sqlalchemy import DateTime, Enum, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -16,10 +16,12 @@ class IndexStatus(str, enum.Enum):
 
 class Repository(Base):
     __tablename__ = "repositories"
+    __table_args__ = (UniqueConstraint("user_id", "github_url"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    github_url: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    github_url: Mapped[str] = mapped_column(String(512), nullable=False)
     default_branch: Mapped[str] = mapped_column(String(255), default="main")
 
     index_status: Mapped[IndexStatus] = mapped_column(

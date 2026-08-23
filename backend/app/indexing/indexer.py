@@ -9,7 +9,7 @@ from app.indexing.embeddings import embed_texts
 from app.indexing.git import cloned_repo, walk_source_files
 from app.indexing.parser import parse_file
 from app.indexing.vector_store import delete_repository_vectors, upsert_symbol_vectors
-from app.models.code_graph import CodeFile, CodeSymbol, SymbolCall, SymbolType
+from app.models.code_graph import CodeFile, CodeSymbol, EdgeKind, SymbolCall, SymbolType
 from app.models.repository import Repository
 
 
@@ -53,7 +53,7 @@ def index_repository(
     # sharing a name will incorrectly link. That's a real limitation, full
     # resolution would need type/import analysis, out of scope for now.
     name_to_symbol_id: dict[str, int] = {}
-    pending_calls: list[tuple[int, str]] = []
+    pending_calls: list[tuple[int, str, EdgeKind]] = []
     embedding_texts: list[str] = []
     embedding_symbol_ids: list[int] = []
     files_indexed = 0
@@ -126,7 +126,12 @@ def index_repository(
             for call in result.calls:
                 caller_id = _innermost_symbol_at(file_symbol_ranges, call.line)
                 if caller_id is not None:
-                    pending_calls.append((caller_id, call.name))
+                    pending_calls.append((caller_id, call.name, EdgeKind.CALL))
+
+            for reference in result.references:
+                caller_id = _innermost_symbol_at(file_symbol_ranges, reference.line)
+                if caller_id is not None:
+                    pending_calls.append((caller_id, reference.name, EdgeKind.REFERENCE))
 
     logger.info(
         "[%s] parsed %d/%d files in %.1fs: %d symbols, %d call sites%s",
@@ -143,20 +148,24 @@ def index_repository(
     calls_found = 0
     unresolved = 0
     seen_edges: set[tuple[int, int]] = set()
-    for caller_id, call_name in pending_calls:
+    # Calls first, so that when the same pair appears as both a call and a
+    # mere reference, the edge is recorded as the stronger of the two.
+    pending_calls.sort(key=lambda item: 0 if item[2] == EdgeKind.CALL else 1)
+
+    for caller_id, call_name, kind in pending_calls:
         callee_id = name_to_symbol_id.get(call_name)
         if callee_id is None:
-            # Almost always a library or builtin call, not something defined
-            # in this repository, so there is nothing to draw an edge to.
+            # A library or builtin, or a local variable, rather than
+            # something defined in this repository: nothing to link to.
             unresolved += 1
             continue
         if callee_id == caller_id:
             continue
-        # A calls B ten times is still one edge in the graph.
+        # A uses B ten times is still one edge in the graph.
         if (caller_id, callee_id) in seen_edges:
             continue
         seen_edges.add((caller_id, callee_id))
-        db.add(SymbolCall(caller_id=caller_id, callee_id=callee_id))
+        db.add(SymbolCall(caller_id=caller_id, callee_id=callee_id, kind=kind))
         calls_found += 1
 
     db.commit()

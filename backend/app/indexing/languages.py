@@ -21,6 +21,11 @@ class LanguageAdapter:
     function_query: Query
     class_query: Query
     call_query: Query
+    # Bare identifier uses. A function is often handed to something rather
+    # than called: `Depends(get_current_user)`, a JSX callback prop, a type
+    # annotation. Those are real usages, and a "what breaks if I change
+    # this?" answer that ignores them is worse than useless.
+    reference_query: Query
 
     def parser(self) -> Parser:
         return Parser(self.language)
@@ -50,6 +55,7 @@ PYTHON = LanguageAdapter(
         (call function: (attribute attribute: (identifier) @call.name))
         """,
     ),
+    reference_query=Query(_PY_LANGUAGE, "(identifier) @ref.name"),
 )
 
 # JavaScript and TypeScript share almost all of their relevant grammar node
@@ -67,6 +73,13 @@ _JS_STYLE_CALL_QUERY = """
 (call_expression function: (identifier) @call.name)
 (call_expression function: (member_expression property: (property_identifier) @call.name))
 """
+# Plain JavaScript has no `type_identifier` node; only the TypeScript
+# grammar does, so the two need separate reference queries.
+_JS_REFERENCE_QUERY = "(identifier) @ref.name"
+_TS_REFERENCE_QUERY = """
+(identifier) @ref.name
+(type_identifier) @ref.name
+"""
 
 JAVASCRIPT = LanguageAdapter(
     name="javascript",
@@ -75,6 +88,7 @@ JAVASCRIPT = LanguageAdapter(
     function_query=Query(_JS_LANGUAGE, _JS_STYLE_FUNCTION_QUERY),
     class_query=Query(_JS_LANGUAGE, _JS_STYLE_CLASS_QUERY),
     call_query=Query(_JS_LANGUAGE, _JS_STYLE_CALL_QUERY),
+    reference_query=Query(_JS_LANGUAGE, _JS_REFERENCE_QUERY),
 )
 
 TYPESCRIPT = LanguageAdapter(
@@ -84,6 +98,7 @@ TYPESCRIPT = LanguageAdapter(
     function_query=Query(_TS_LANGUAGE, _JS_STYLE_FUNCTION_QUERY),
     class_query=Query(_TS_LANGUAGE, _JS_STYLE_CLASS_QUERY),
     call_query=Query(_TS_LANGUAGE, _JS_STYLE_CALL_QUERY),
+    reference_query=Query(_TS_LANGUAGE, _TS_REFERENCE_QUERY),
 )
 
 TSX = LanguageAdapter(
@@ -93,6 +108,7 @@ TSX = LanguageAdapter(
     function_query=Query(_TSX_LANGUAGE, _JS_STYLE_FUNCTION_QUERY),
     class_query=Query(_TSX_LANGUAGE, _JS_STYLE_CLASS_QUERY),
     call_query=Query(_TSX_LANGUAGE, _JS_STYLE_CALL_QUERY),
+    reference_query=Query(_TSX_LANGUAGE, _TS_REFERENCE_QUERY),
 )
 
 ADAPTERS: tuple[LanguageAdapter, ...] = (PYTHON, JAVASCRIPT, TYPESCRIPT, TSX)

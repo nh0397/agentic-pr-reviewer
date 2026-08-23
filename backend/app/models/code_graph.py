@@ -52,11 +52,19 @@ class CodeSymbol(Base):
     qdrant_point_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class EdgeKind(str, enum.Enum):
+    CALL = "call"
+    # Used without being invoked: passed as an argument, named as a type.
+    # Still a real dependency for "what breaks if I change this?".
+    REFERENCE = "reference"
+
+
 class SymbolCall(Base):
-    """An edge in the dependency graph: caller_id's code calls callee_id."""
+    """An edge in the dependency graph: caller_id's code uses callee_id."""
 
     __tablename__ = "symbol_calls"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     caller_id: Mapped[int] = mapped_column(ForeignKey("code_symbols.id"), nullable=False)
     callee_id: Mapped[int] = mapped_column(ForeignKey("code_symbols.id"), nullable=False)
+    kind: Mapped[EdgeKind] = mapped_column(Enum(EdgeKind), default=EdgeKind.CALL, nullable=False)

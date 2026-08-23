@@ -23,6 +23,10 @@ class ExtractedFile:
     language: str
     symbols: list[ExtractedSymbol]
     calls: list[ExtractedCall]
+    # Identifier uses that are not calls: passing a function as an argument,
+    # naming a type, referencing a class. Same shape as calls so both can be
+    # attributed to their enclosing symbol the same way.
+    references: list[ExtractedCall]
 
 
 def parse_file(path: str, source: bytes) -> ExtractedFile | None:
@@ -38,7 +42,10 @@ def parse_file(path: str, source: bytes) -> ExtractedFile | None:
     tree = adapter.parser().parse(source)
     symbols = _extract_symbols(adapter, source, tree.root_node)
     calls = _extract_calls(adapter, tree.root_node)
-    return ExtractedFile(language=adapter.name, symbols=symbols, calls=calls)
+    references = _extract_references(adapter, tree.root_node, calls)
+    return ExtractedFile(
+        language=adapter.name, symbols=symbols, calls=calls, references=references
+    )
 
 
 def _extract_symbols(adapter: LanguageAdapter, source: bytes, root_node) -> list[ExtractedSymbol]:
@@ -69,6 +76,28 @@ def _extract_symbols(adapter: LanguageAdapter, source: bytes, root_node) -> list
                 )
             )
     return symbols
+
+
+def _extract_references(
+    adapter: LanguageAdapter, root_node, calls: list[ExtractedCall]
+) -> list[ExtractedCall]:
+    """
+    Every identifier use, minus the ones already recorded as calls so the
+    same site is not counted twice. Names that do not correspond to a symbol
+    defined in the repository are dropped later, during indexing, which is
+    where the set of known symbol names actually lives.
+    """
+    captures = adapter.reference_query.captures(root_node)
+    call_sites = {(c.name, c.line) for c in calls}
+
+    references: list[ExtractedCall] = []
+    for node in captures.get("ref.name", []):
+        name = node.text.decode("utf-8", errors="replace")
+        line = node.start_point[0] + 1
+        if (name, line) in call_sites:
+            continue
+        references.append(ExtractedCall(name=name, line=line))
+    return references
 
 
 def _extract_calls(adapter: LanguageAdapter, root_node) -> list[ExtractedCall]:

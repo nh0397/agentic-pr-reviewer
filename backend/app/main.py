@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.api.routes import auth, github, health, repositories
+from app.api.routes import auth, github, health, indexing, repositories
 from app.config import get_settings
 
 settings = get_settings()
@@ -26,3 +26,4 @@ app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(github.router)
 app.include_router(repositories.router)
+app.include_router(indexing.router)

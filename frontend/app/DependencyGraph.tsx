@@ -59,7 +59,7 @@ export function DependencyGraph({
             markerHeight="5"
             orient="auto-start-reverse"
           >
-            <path d="M 0 0 L 10 5 L 0 10 z" className="fill-zinc-400 dark:fill-zinc-600" />
+            <path d="M 0 0 L 10 5 L 0 10 z" className="fill-zinc-500 dark:fill-zinc-400" />
           </marker>
         </defs>
 
@@ -85,9 +85,9 @@ export function DependencyGraph({
               x2={endX}
               y2={endY}
               markerEnd="url(#graph-arrow)"
-              className="stroke-zinc-300 dark:stroke-zinc-700"
+              className="stroke-zinc-500 dark:stroke-zinc-400"
               strokeWidth={1.5}
-              opacity={dimmed ? 0.15 : 1}
+              opacity={dimmed ? 0.25 : 1}
             />
           );
         })}
@@ -98,31 +98,45 @@ export function DependencyGraph({
           return (
             <g
               key={node.id}
-              opacity={dimmed ? 0.2 : 1}
+              opacity={dimmed ? 0.3 : 1}
               onMouseEnter={() => setHovered(node.id)}
               onMouseLeave={() => setHovered(null)}
               className="cursor-pointer"
             >
-              <circle
-                cx={node.x}
-                cy={node.y}
-                r={hovered === node.id ? 11 : 8}
-                fill={isClass ? "#8b5cf6" : "#6366f1"}
-              />
+              {/* Shape carries the same distinction as colour, so the graph
+                  is still readable in greyscale or with colour blindness.
+                  Classes are squares, functions are circles. */}
+              {isClass ? (
+                <rect
+                  x={node.x - (hovered === node.id ? 10 : 7.5)}
+                  y={node.y - (hovered === node.id ? 10 : 7.5)}
+                  width={hovered === node.id ? 20 : 15}
+                  height={hovered === node.id ? 20 : 15}
+                  rx={2}
+                  className="fill-orange-600 dark:fill-orange-400"
+                />
+              ) : (
+                <circle
+                  cx={node.x}
+                  cy={node.y}
+                  r={hovered === node.id ? 11 : 8}
+                  className="fill-blue-600 dark:fill-blue-400"
+                />
+              )}
               <text
                 x={node.x}
-                y={node.y - 15}
+                y={node.y - 16}
                 textAnchor="middle"
-                className="fill-zinc-700 text-[11px] dark:fill-zinc-300"
+                className="fill-zinc-900 text-[11px] font-medium dark:fill-zinc-100"
               >
                 {node.name}
               </text>
               {hovered === node.id && (
                 <text
                   x={node.x}
-                  y={node.y + 24}
+                  y={node.y + 26}
                   textAnchor="middle"
-                  className="fill-zinc-400 text-[10px]"
+                  className="fill-zinc-600 text-[10px] dark:fill-zinc-300"
                 >
                   {node.path}
                 </text>
@@ -132,13 +146,13 @@ export function DependencyGraph({
         })}
       </svg>
 
-      <div className="flex items-center gap-4 border-t border-zinc-200 px-4 py-2 text-xs text-zinc-500 dark:border-zinc-800">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-zinc-200 px-4 py-2 text-xs text-zinc-600 dark:border-zinc-800 dark:text-zinc-400">
         <span className="flex items-center gap-1.5">
-          <span className="h-2.5 w-2.5 rounded-full" style={{ background: "#6366f1" }} />
+          <span className="h-2.5 w-2.5 rounded-full bg-blue-600 dark:bg-blue-400" />
           Function
         </span>
         <span className="flex items-center gap-1.5">
-          <span className="h-2.5 w-2.5 rounded-full" style={{ background: "#8b5cf6" }} />
+          <span className="h-2.5 w-2.5 rounded-[2px] bg-orange-600 dark:bg-orange-400" />
           Class
         </span>
         <span>Arrow points from caller to callee. Hover a node to isolate it.</span>

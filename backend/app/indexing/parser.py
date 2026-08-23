@@ -13,10 +13,16 @@ class ExtractedSymbol:
 
 
 @dataclass
+class ExtractedCall:
+    name: str
+    line: int  # used to attribute the call to its enclosing function/class
+
+
+@dataclass
 class ExtractedFile:
     language: str
     symbols: list[ExtractedSymbol]
-    call_names: list[str]  # every name called anywhere in the file
+    calls: list[ExtractedCall]
 
 
 def parse_file(path: str, source: bytes) -> ExtractedFile | None:
@@ -31,8 +37,8 @@ def parse_file(path: str, source: bytes) -> ExtractedFile | None:
 
     tree = adapter.parser().parse(source)
     symbols = _extract_symbols(adapter, source, tree.root_node)
-    call_names = _extract_call_names(adapter, tree.root_node)
-    return ExtractedFile(language=adapter.name, symbols=symbols, call_names=call_names)
+    calls = _extract_calls(adapter, tree.root_node)
+    return ExtractedFile(language=adapter.name, symbols=symbols, calls=calls)
 
 
 def _extract_symbols(adapter: LanguageAdapter, source: bytes, root_node) -> list[ExtractedSymbol]:
@@ -65,6 +71,12 @@ def _extract_symbols(adapter: LanguageAdapter, source: bytes, root_node) -> list
     return symbols
 
 
-def _extract_call_names(adapter: LanguageAdapter, root_node) -> list[str]:
+def _extract_calls(adapter: LanguageAdapter, root_node) -> list[ExtractedCall]:
     captures = adapter.call_query.captures(root_node)
-    return [node.text.decode("utf-8", errors="replace") for node in captures.get("call.name", [])]
+    return [
+        ExtractedCall(
+            name=node.text.decode("utf-8", errors="replace"),
+            line=node.start_point[0] + 1,
+        )
+        for node in captures.get("call.name", [])
+    ]

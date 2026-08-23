@@ -26,7 +26,7 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
     # sharing a name will incorrectly link. That's a real limitation, full
     # resolution would need type/import analysis, out of scope for now.
     name_to_symbol_id: dict[str, int] = {}
-    pending_calls: list[tuple[int, list[str]]] = []
+    pending_calls: list[tuple[int, str]] = []
     embedding_texts: list[str] = []
     embedding_symbol_ids: list[int] = []
     files_indexed = 0
@@ -48,7 +48,9 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
             db.flush()  # need code_file.id before creating its symbols
             files_indexed += 1
 
-            file_symbol_ids: list[int] = []
+            # (symbol_id, start_line, end_line) for this file, used below to
+            # work out which symbol each call sits inside.
+            file_symbol_ranges: list[tuple[int, int, int]] = []
             for symbol in result.symbols:
                 row = CodeSymbol(
                     file_id=code_file.id,
@@ -60,20 +62,27 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
                 db.add(row)
                 db.flush()  # need row.id for the name map and embedding link
                 name_to_symbol_id.setdefault(symbol.name, row.id)
-                file_symbol_ids.append(row.id)
+                file_symbol_ranges.append((row.id, symbol.start_line, symbol.end_line))
                 embedding_texts.append(symbol.source[:2000])
                 embedding_symbol_ids.append(row.id)
 
-            for symbol_id in file_symbol_ids:
-                pending_calls.append((symbol_id, result.call_names))
+            for call in result.calls:
+                caller_id = _innermost_symbol_at(file_symbol_ranges, call.line)
+                if caller_id is not None:
+                    pending_calls.append((caller_id, call.name))
 
     calls_found = 0
-    for caller_id, call_names in pending_calls:
-        for name in call_names:
-            callee_id = name_to_symbol_id.get(name)
-            if callee_id and callee_id != caller_id:
-                db.add(SymbolCall(caller_id=caller_id, callee_id=callee_id))
-                calls_found += 1
+    seen_edges: set[tuple[int, int]] = set()
+    for caller_id, call_name in pending_calls:
+        callee_id = name_to_symbol_id.get(call_name)
+        if callee_id is None or callee_id == caller_id:
+            continue
+        # A calls B ten times is still one edge in the graph.
+        if (caller_id, callee_id) in seen_edges:
+            continue
+        seen_edges.add((caller_id, callee_id))
+        db.add(SymbolCall(caller_id=caller_id, callee_id=callee_id))
+        calls_found += 1
 
     db.commit()
 
@@ -96,6 +105,24 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
         symbols_found=len(embedding_symbol_ids),
         calls_found=calls_found,
     )
+
+
+def _innermost_symbol_at(
+    symbol_ranges: list[tuple[int, int, int]], line: int
+) -> int | None:
+    """
+    Which symbol does this line belong to? A method inside a class sits
+    inside both, so the narrowest range wins: a call in a method is the
+    method's call, not the whole class's.
+    """
+    best_id: int | None = None
+    best_span: int | None = None
+    for symbol_id, start_line, end_line in symbol_ranges:
+        if start_line <= line <= end_line:
+            span = end_line - start_line
+            if best_span is None or span < best_span:
+                best_id, best_span = symbol_id, span
+    return best_id
 
 
 def _clear_existing_index(repository_id: int, db: Session) -> None:

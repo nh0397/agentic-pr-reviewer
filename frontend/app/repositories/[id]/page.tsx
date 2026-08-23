@@ -30,6 +30,14 @@ type Repository = {
   index_status: string;
 };
 
+type IndexJob = {
+  id: number;
+  repository_id: number;
+  status: "queued" | "running" | "succeeded" | "failed";
+  queue_position: number;
+  error: string | null;
+};
+
 export default function RepositoryDetailPage({
   params,
 }: {
@@ -42,8 +50,10 @@ export default function RepositoryDetailPage({
   const [repository, setRepository] = useState<Repository | null>(null);
   const [graph, setGraph] = useState<RepositoryGraph | null>(null);
   const [loading, setLoading] = useState(true);
-  const [indexing, setIndexing] = useState(false);
+  const [job, setJob] = useState<IndexJob | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const indexing = job?.status === "queued" || job?.status === "running";
 
   useEffect(() => {
     if (!checkingSession && !user && !backendUnreachable) {
@@ -53,12 +63,16 @@ export default function RepositoryDetailPage({
 
   const load = useCallback(async () => {
     try {
-      const [repoRes, graphRes] = await Promise.all([
+      const [repoRes, graphRes, jobRes] = await Promise.all([
         fetch(`${API_BASE_URL}/api/repositories/${id}`, fetchOpts),
         fetch(`${API_BASE_URL}/api/repositories/${id}/graph`, fetchOpts),
+        fetch(`${API_BASE_URL}/api/repositories/${id}/index`, fetchOpts),
       ]);
       if (repoRes.ok) setRepository(await repoRes.json());
       if (graphRes.ok) setGraph(await graphRes.json());
+      // Picks up a job already in flight, e.g. queued from the dashboard
+      // before navigating here.
+      if (jobRes.ok) setJob(await jobRes.json());
     } catch {
       setError("Could not reach the backend.");
     } finally {
@@ -71,24 +85,42 @@ export default function RepositoryDetailPage({
   }, [user, load]);
 
   async function reindex() {
-    setIndexing(true);
     setError(null);
     try {
       const res = await fetch(`${API_BASE_URL}/api/repositories/${id}/index`, {
         ...fetchOpts,
         method: "POST",
       });
+      const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
         throw new Error(body.detail ?? `Backend responded with ${res.status}`);
       }
-      await load();
+      setJob(body as IndexJob);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Indexing failed");
-    } finally {
-      setIndexing(false);
+      setError(err instanceof Error ? err.message : "Could not queue indexing");
     }
   }
+
+  // Poll only while this repository has work outstanding, then refresh the
+  // graph once it lands so the page shows the newly indexed result.
+  useEffect(() => {
+    if (!job || (job.status !== "queued" && job.status !== "running")) return;
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/repositories/${id}/index`, fetchOpts);
+        if (!res.ok) return;
+        const latest: IndexJob | null = await res.json();
+        setJob(latest);
+        if (latest && latest.status === "succeeded") load();
+        if (latest && latest.status === "failed") {
+          setError(latest.error ?? "Indexing failed");
+        }
+      } catch {
+        // Transient failure while polling; the next tick will retry.
+      }
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [job, id, load]);
 
   if (checkingSession || (loading && user)) {
     return (
@@ -127,8 +159,11 @@ export default function RepositoryDetailPage({
 
         {indexing && (
           <p className="mt-6 rounded border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300">
-            Cloning the repository, parsing every file, and generating embeddings.
-            This can take a while on a large repository.
+            {job?.status === "queued"
+              ? job.queue_position === 0
+                ? "Queued, starting next."
+                : `Queued behind ${job.queue_position} other ${job.queue_position === 1 ? "repository" : "repositories"}. Repositories are indexed one at a time.`
+              : "Cloning the repository, parsing every file, and generating embeddings. This can take a while on a large repository."}
           </p>
         )}
 

@@ -15,6 +15,14 @@ type Repository = {
   created_at: string;
 };
 
+type IndexJob = {
+  id: number;
+  repository_id: number;
+  status: "queued" | "running" | "succeeded" | "failed";
+  queue_position: number;
+  error: string | null;
+};
+
 type GithubRepo = {
   name: string;
   full_name: string;
@@ -35,8 +43,9 @@ export default function DashboardPage() {
   const [githubRepos, setGithubRepos] = useState<GithubRepo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [connectingRepo, setConnectingRepo] = useState<string | null>(null);
-  const [indexingRepoId, setIndexingRepoId] = useState<number | null>(null);
-  const [indexMessage, setIndexMessage] = useState<string | null>(null);
+  // Keyed by repository id: several repositories can be queued at once, so
+  // a single "which one is indexing" value would erase the others' state.
+  const [jobs, setJobs] = useState<Record<number, IndexJob>>({});
   const [dataUnreachable, setDataUnreachable] = useState(false);
 
   useEffect(() => {
@@ -66,12 +75,41 @@ export default function DashboardPage() {
     }
   }
 
+  async function loadJobs() {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/index/jobs`, fetchOpts);
+      if (!res.ok) return [];
+      const active: IndexJob[] = await res.json();
+      setJobs(Object.fromEntries(active.map((job) => [job.repository_id, job])));
+      return active;
+    } catch {
+      setDataUnreachable(true);
+      return [];
+    }
+  }
+
   useEffect(() => {
     if (user) {
       loadRepositories();
       loadGithubRepos();
+      loadJobs();
     }
   }, [user]);
+
+  const hasActiveJobs = Object.keys(jobs).length > 0;
+
+  useEffect(() => {
+    // Only poll while something is actually queued or running, so an idle
+    // dashboard is not hitting the API every second forever.
+    if (!user || !hasActiveJobs) return;
+    const timer = setInterval(async () => {
+      const active = await loadJobs();
+      // A job leaving the active list means it finished, so pick up the
+      // repository's new status and counts.
+      if (active.length === 0) loadRepositories();
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [user, hasActiveJobs]);
 
   async function connectRepo(repo: GithubRepo) {
     setConnectingRepo(repo.full_name);
@@ -100,8 +138,6 @@ export default function DashboardPage() {
   }
 
   async function indexRepo(repo: Repository) {
-    setIndexingRepoId(repo.id);
-    setIndexMessage(null);
     setError(null);
     try {
       const res = await fetch(`${API_BASE_URL}/api/repositories/${repo.id}/index`, {
@@ -112,14 +148,10 @@ export default function DashboardPage() {
       if (!res.ok) {
         throw new Error(body.detail ?? `Backend responded with ${res.status}`);
       }
-      setIndexMessage(
-        `${repo.name}: indexed ${body.files_indexed} files, found ${body.symbols_found} symbols and ${body.calls_found} calls.`
-      );
-      await loadRepositories();
+      // Returns immediately with a queued job; the poller takes it from here.
+      setJobs((current) => ({ ...current, [repo.id]: body as IndexJob }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to index repository");
-    } finally {
-      setIndexingRepoId(null);
+      setError(err instanceof Error ? err.message : "Failed to queue indexing");
     }
   }
 
@@ -176,11 +208,6 @@ export default function DashboardPage() {
         )}
 
         {error && <p className="mt-6 text-sm text-red-600">{error}</p>}
-        {indexMessage && (
-          <p className="mt-6 rounded border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">
-            {indexMessage}
-          </p>
-        )}
 
         <div className="mt-10">
           <h2 className="text-lg font-medium text-black dark:text-zinc-50">
@@ -191,7 +218,10 @@ export default function DashboardPage() {
           ) : (
             <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
               {repositories.map((repo) => {
-                const indexing = indexingRepoId === repo.id;
+                const job = jobs[repo.id];
+                const running = job?.status === "running";
+                const queued = job?.status === "queued";
+                const busy = running || queued;
                 return (
                   <div
                     key={repo.id}
@@ -201,22 +231,32 @@ export default function DashboardPage() {
                       <p className="truncate font-medium text-black dark:text-zinc-50">
                         {repo.name}
                       </p>
-                      <StatusPill status={indexing ? "indexing" : repo.index_status} />
+                      <StatusPill
+                        status={queued ? "queued" : running ? "indexing" : repo.index_status}
+                      />
                     </div>
                     <p className="mt-1 text-xs text-zinc-400">
-                      Default branch: {repo.default_branch}
+                      {queued
+                        ? job.queue_position === 0
+                          ? "Next in queue"
+                          : `Waiting behind ${job.queue_position} repository${job.queue_position === 1 ? "" : "s"}`
+                        : running
+                          ? "Cloning, parsing, and embedding..."
+                          : `Default branch: ${repo.default_branch}`}
                     </p>
                     <div className="mt-3 flex gap-2">
                       <button
-                        disabled={indexing}
+                        disabled={busy}
                         onClick={() => indexRepo(repo)}
                         className="flex-1 rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-black transition disabled:opacity-50 dark:border-zinc-700 dark:text-white"
                       >
-                        {indexing
-                          ? "Indexing..."
-                          : repo.index_status === "indexed"
-                            ? "Re-index"
-                            : "Index"}
+                        {queued
+                          ? "Queued"
+                          : running
+                            ? "Indexing..."
+                            : repo.index_status === "indexed"
+                              ? "Re-index"
+                              : "Index"}
                       </button>
                       {repo.index_status === "indexed" && (
                         <Link
@@ -303,6 +343,10 @@ const STATUS_STYLES: Record<string, { label: string; className: string; pulse?: 
   not_indexed: {
     label: "Not indexed",
     className: "bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400",
+  },
+  queued: {
+    label: "Queued",
+    className: "bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-400",
   },
   indexing: {
     label: "Indexing",

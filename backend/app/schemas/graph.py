@@ -31,3 +31,15 @@ class RepositoryGraph(BaseModel):
     stats: GraphStats
     nodes: list[GraphNode]
     edges: list[GraphEdge]
+
+
+class IndexJobRead(BaseModel):
+    id: int
+    repository_id: int
+    status: str
+    # 0 while running or next in line, higher the further back it is.
+    queue_position: int
+    error: str | None = None
+    files_indexed: int | None = None
+    symbols_found: int | None = None
+    calls_found: int | None = None

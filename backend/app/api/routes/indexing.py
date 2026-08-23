@@ -1,19 +1,19 @@
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
 from app.db.session import get_db
-from app.indexing.indexer import index_repository
+from app.indexing.queue import enqueue_job, queue_position
 from app.models.code_graph import CodeFile, CodeSymbol, SymbolCall, SymbolType
-from app.models.repository import IndexStatus, Repository
+from app.models.index_job import IndexJob, JobStatus
+from app.models.repository import Repository
 from app.models.user import User
 from app.schemas.graph import (
     GraphEdge,
     GraphNode,
     GraphStats,
+    IndexJobRead,
     LanguageBreakdown,
     RepositoryGraph,
 )
@@ -26,45 +26,78 @@ router = APIRouter(prefix="/api/repositories", tags=["indexing"])
 MAX_GRAPH_EDGES = 300
 
 
-@router.post("/{repository_id}/index")
+def _job_response(job: IndexJob, db: Session) -> IndexJobRead:
+    return IndexJobRead(
+        id=job.id,
+        repository_id=job.repository_id,
+        status=job.status.value,
+        queue_position=queue_position(job, db),
+        error=job.error,
+        files_indexed=job.files_indexed,
+        symbols_found=job.symbols_found,
+        calls_found=job.calls_found,
+    )
+
+
+@router.post("/{repository_id}/index", response_model=IndexJobRead, status_code=202)
 def trigger_indexing(
     repository_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> dict:
+) -> IndexJobRead:
     """
-    Synchronous on purpose for now: the request blocks until indexing
-    finishes. A real deployment would move this to a background job, since
-    indexing a large repo can take well over a typical request timeout, but
-    that's a deliberate later step once this pipeline itself is proven.
+    Queues the repository and returns immediately. Indexing clones the repo
+    and embeds every symbol, which is far too slow to hold an HTTP request
+    open for, and running several at once would only make each one slower.
+    A single background worker drains the queue one repository at a time.
     """
     repository = db.get(Repository, repository_id)
     if repository is None or repository.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Repository not found")
 
-    repository.index_status = IndexStatus.INDEXING
-    db.commit()
+    job = enqueue_job(repository_id, db)
+    return _job_response(job, db)
 
-    try:
-        # The user's own GitHub token works for cloning both public and
-        # private repos, so there's no need to track a separate "is this
-        # repo private" flag just to decide whether to authenticate.
-        result = index_repository(repository, current_user.access_token, db)
-    except Exception as exc:
-        repository.index_status = IndexStatus.FAILED
-        db.commit()
-        raise HTTPException(status_code=500, detail=f"Indexing failed: {exc}") from exc
 
-    repository.index_status = IndexStatus.INDEXED
-    repository.indexed_at = datetime.now(timezone.utc)
-    db.commit()
+@router.get("/{repository_id}/index", response_model=IndexJobRead | None)
+def get_index_job(
+    repository_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> IndexJobRead | None:
+    """Most recent job for this repository, which is what the UI polls."""
+    repository = db.get(Repository, repository_id)
+    if repository is None or repository.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Repository not found")
 
-    return {
-        "status": "indexed",
-        "files_indexed": result.files_indexed,
-        "symbols_found": result.symbols_found,
-        "calls_found": result.calls_found,
-    }
+    job = db.scalar(
+        select(IndexJob)
+        .where(IndexJob.repository_id == repository_id)
+        .order_by(IndexJob.created_at.desc())
+        .limit(1)
+    )
+    return _job_response(job, db) if job else None
+
+
+@router.get("/index/jobs", response_model=list[IndexJobRead])
+def list_active_jobs(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[IndexJobRead]:
+    """
+    Every queued or running job for this user, so the dashboard can show
+    the state of all repositories in one request instead of one per card.
+    """
+    repo_ids = select(Repository.id).where(Repository.user_id == current_user.id)
+    jobs = db.scalars(
+        select(IndexJob)
+        .where(
+            IndexJob.repository_id.in_(repo_ids),
+            IndexJob.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+        )
+        .order_by(IndexJob.created_at)
+    ).all()
+    return [_job_response(job, db) for job in jobs]
 
 
 @router.get("/{repository_id}/graph", response_model=RepositoryGraph)

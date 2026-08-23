@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from contextlib import asynccontextmanager
 
@@ -9,6 +10,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.api.routes import auth, github, health, indexing, repositories
 from app.config import get_settings
 from app.db.session import engine
+from app.indexing.queue import worker_loop
 
 settings = get_settings()
 
@@ -31,7 +33,21 @@ async def lifespan(app: FastAPI):
             "Start it first, from the project root:\n\n"
             "    docker compose up -d\n"
         )
-    yield
+
+    # One worker drains the index queue for the lifetime of the app.
+    stop_event = asyncio.Event()
+    worker = asyncio.create_task(worker_loop(stop_event))
+    try:
+        yield
+    finally:
+        stop_event.set()
+        worker.cancel()
+        # Cancelling is expected on shutdown; anything else is a real error
+        # and should not be swallowed here.
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Agentic PR Reviewer", version="0.1.0", lifespan=lifespan)

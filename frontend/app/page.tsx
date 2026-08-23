@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 
 import { API_BASE_URL, fetchOpts, useSession } from "./useSession";
 
@@ -205,17 +206,27 @@ export default function DashboardPage() {
                     <p className="mt-1 text-xs text-zinc-400">
                       Default branch: {repo.default_branch}
                     </p>
-                    <button
-                      disabled={indexing}
-                      onClick={() => indexRepo(repo)}
-                      className="mt-3 w-full rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-black transition disabled:opacity-50 dark:border-zinc-700 dark:text-white"
-                    >
-                      {indexing
-                        ? "Indexing..."
-                        : repo.index_status === "indexed"
-                          ? "Re-index"
-                          : "Index"}
-                    </button>
+                    <div className="mt-3 flex gap-2">
+                      <button
+                        disabled={indexing}
+                        onClick={() => indexRepo(repo)}
+                        className="flex-1 rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-black transition disabled:opacity-50 dark:border-zinc-700 dark:text-white"
+                      >
+                        {indexing
+                          ? "Indexing..."
+                          : repo.index_status === "indexed"
+                            ? "Re-index"
+                            : "Index"}
+                      </button>
+                      {repo.index_status === "indexed" && (
+                        <Link
+                          href={`/repositories/${repo.id}`}
+                          className="flex-1 rounded-lg bg-black px-3 py-1.5 text-center text-sm font-medium text-white transition hover:opacity-90 dark:bg-white dark:text-black"
+                        >
+                          View
+                        </Link>
+                      )}
+                    </div>
                   </div>
                 );
               })}

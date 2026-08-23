@@ -11,8 +11,10 @@ from app.api.routes import auth, github, health, indexing, repositories
 from app.config import get_settings
 from app.db.session import engine
 from app.indexing.queue import worker_loop
+from app.logging_config import configure_logging
 
 settings = get_settings()
+configure_logging()
 
 
 @asynccontextmanager

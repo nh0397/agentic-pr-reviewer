@@ -1,3 +1,5 @@
+import logging
+import time
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
@@ -10,6 +12,13 @@ from app.models.code_graph import CodeFile, CodeSymbol, SymbolCall, SymbolType
 from app.models.repository import Repository
 
 
+logger = logging.getLogger("indexing")
+
+# How often to report progress while walking files. Logging every file is
+# unreadable on a large repository; this gives a steady heartbeat instead.
+PROGRESS_EVERY_N_FILES = 25
+
+
 @dataclass
 class IndexResult:
     files_indexed: int
@@ -18,6 +27,8 @@ class IndexResult:
 
 
 def index_repository(repository: Repository, access_token: str | None, db: Session) -> IndexResult:
+    started = time.monotonic()
+    logger.info("[%s] clearing any previous index", repository.name)
     _clear_existing_index(repository.id, db)
 
     # Accumulated across every file in the repo, not reset per file, so a
@@ -31,11 +42,33 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
     embedding_symbol_ids: list[int] = []
     files_indexed = 0
 
+    # Never log the authenticated clone URL; it carries the access token.
+    logger.info("[%s] cloning %s", repository.name, repository.github_url)
+    clone_started = time.monotonic()
+
     with cloned_repo(repository.github_url, access_token) as repo_path:
+        logger.info(
+            "[%s] cloned in %.1fs, walking files", repository.name, time.monotonic() - clone_started
+        )
+        parse_started = time.monotonic()
+        files_seen = 0
+        files_skipped = 0
+
         for path in walk_source_files(repo_path):
+            files_seen += 1
+            if files_seen % PROGRESS_EVERY_N_FILES == 0:
+                logger.info(
+                    "[%s] %d files scanned, %d indexed so far (%d symbols)",
+                    repository.name,
+                    files_seen,
+                    files_indexed,
+                    len(embedding_symbol_ids),
+                )
+
             try:
                 source = path.read_bytes()
             except OSError:
+                files_skipped += 1
                 continue
 
             relative_path = str(path.relative_to(repo_path))
@@ -71,11 +104,28 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
                 if caller_id is not None:
                     pending_calls.append((caller_id, call.name))
 
+    logger.info(
+        "[%s] parsed %d/%d files in %.1fs: %d symbols, %d call sites%s",
+        repository.name,
+        files_indexed,
+        files_seen,
+        time.monotonic() - parse_started,
+        len(embedding_symbol_ids),
+        len(pending_calls),
+        f", {files_skipped} unreadable" if files_skipped else "",
+    )
+
     calls_found = 0
+    unresolved = 0
     seen_edges: set[tuple[int, int]] = set()
     for caller_id, call_name in pending_calls:
         callee_id = name_to_symbol_id.get(call_name)
-        if callee_id is None or callee_id == caller_id:
+        if callee_id is None:
+            # Almost always a library or builtin call, not something defined
+            # in this repository, so there is nothing to draw an edge to.
+            unresolved += 1
+            continue
+        if callee_id == caller_id:
             continue
         # A calls B ten times is still one edge in the graph.
         if (caller_id, callee_id) in seen_edges:
@@ -85,8 +135,16 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
         calls_found += 1
 
     db.commit()
+    logger.info(
+        "[%s] resolved %d call edges (%d call sites pointed outside this repository)",
+        repository.name,
+        calls_found,
+        unresolved,
+    )
 
     if embedding_texts:
+        logger.info("[%s] embedding %d symbols...", repository.name, len(embedding_texts))
+        embed_started = time.monotonic()
         vectors = embed_texts(embedding_texts)
         points = [
             (symbol_id, vector, {"repository_id": repository.id, "symbol_id": symbol_id})
@@ -99,6 +157,23 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
                 {"qdrant_point_id": str(symbol_id)}
             )
         db.commit()
+        logger.info(
+            "[%s] embedded and stored %d vectors in %.1fs",
+            repository.name,
+            len(vectors),
+            time.monotonic() - embed_started,
+        )
+    else:
+        logger.info("[%s] no symbols found, nothing to embed", repository.name)
+
+    logger.info(
+        "[%s] finished in %.1fs: %d files, %d symbols, %d call edges",
+        repository.name,
+        time.monotonic() - started,
+        files_indexed,
+        len(embedding_symbol_ids),
+        calls_found,
+    )
 
     return IndexResult(
         files_indexed=files_indexed,

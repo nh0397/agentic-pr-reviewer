@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 
 import { API_BASE_URL, fetchOpts, useSession } from "./useSession";
+import { IndexProgress, type IndexJob } from "./IndexProgress";
 
 type Repository = {
   id: number;
@@ -13,14 +14,6 @@ type Repository = {
   default_branch: string;
   index_status: string;
   created_at: string;
-};
-
-type IndexJob = {
-  id: number;
-  repository_id: number;
-  status: "queued" | "running" | "succeeded" | "failed";
-  queue_position: number;
-  error: string | null;
 };
 
 type GithubRepo = {
@@ -107,7 +100,7 @@ export default function DashboardPage() {
       // A job leaving the active list means it finished, so pick up the
       // repository's new status and counts.
       if (active.length === 0) loadRepositories();
-    }, 1500);
+    }, 1000);
     return () => clearInterval(timer);
   }, [user, hasActiveJobs]);
 
@@ -235,15 +228,13 @@ export default function DashboardPage() {
                         status={queued ? "queued" : running ? "indexing" : repo.index_status}
                       />
                     </div>
-                    <p className="mt-1 text-xs text-zinc-400">
-                      {queued
-                        ? job.queue_position === 0
-                          ? "Next in queue"
-                          : `Waiting behind ${job.queue_position} repository${job.queue_position === 1 ? "" : "s"}`
-                        : running
-                          ? "Cloning, parsing, and embedding..."
-                          : `Default branch: ${repo.default_branch}`}
-                    </p>
+                    {busy ? (
+                      <IndexProgress job={job} />
+                    ) : (
+                      <p className="mt-1 text-xs text-zinc-400">
+                        Default branch: {repo.default_branch}
+                      </p>
+                    )}
                     <div className="mt-3 flex gap-2">
                       <button
                         disabled={busy}

@@ -6,6 +6,7 @@ import Link from "next/link";
 
 import { API_BASE_URL, fetchOpts, useSession } from "../../useSession";
 import { DependencyGraph, type GraphEdge, type GraphNode } from "../../DependencyGraph";
+import { IndexProgress, type IndexJob } from "../../IndexProgress";
 
 type LanguageBreakdown = { language: string; files: number };
 
@@ -30,13 +31,6 @@ type Repository = {
   index_status: string;
 };
 
-type IndexJob = {
-  id: number;
-  repository_id: number;
-  status: "queued" | "running" | "succeeded" | "failed";
-  queue_position: number;
-  error: string | null;
-};
 
 export default function RepositoryDetailPage({
   params,
@@ -118,7 +112,7 @@ export default function RepositoryDetailPage({
       } catch {
         // Transient failure while polling; the next tick will retry.
       }
-    }, 1500);
+    }, 1000);
     return () => clearInterval(timer);
   }, [job, id, load]);
 
@@ -157,14 +151,10 @@ export default function RepositoryDetailPage({
 
         {error && <p className="mt-6 text-sm text-red-600">{error}</p>}
 
-        {indexing && (
-          <p className="mt-6 rounded border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300">
-            {job?.status === "queued"
-              ? job.queue_position === 0
-                ? "Queued, starting next."
-                : `Queued behind ${job.queue_position} other ${job.queue_position === 1 ? "repository" : "repositories"}. Repositories are indexed one at a time.`
-              : "Cloning the repository, parsing every file, and generating embeddings. This can take a while on a large repository."}
-          </p>
+        {indexing && job && (
+          <div className="mt-6 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 dark:border-amber-900 dark:bg-amber-950">
+            <IndexProgress job={job} />
+          </div>
         )}
 
         {graph && (

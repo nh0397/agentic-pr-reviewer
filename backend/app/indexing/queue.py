@@ -1,8 +1,9 @@
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.db.session import SessionLocal
 from app.indexing.indexer import index_repository
@@ -10,7 +11,7 @@ from app.models.index_job import IndexJob, JobStatus
 from app.models.repository import IndexStatus, Repository
 from app.models.user import User
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("indexing.queue")
 
 # How long the worker waits before looking for new work when the queue is
 # empty. Short enough that a click feels immediate, long enough that an idle
@@ -21,6 +22,14 @@ IDLE_POLL_SECONDS = 1.0
 # Only ever exceeded when a job is interrupted rather than finishing, since
 # a job that runs to completion succeeds or fails on its first attempt.
 MAX_ATTEMPTS = 3
+
+# Postgres advisory lock id. Claiming a job and running it both happen while
+# holding this, so only one worker anywhere indexes at a time, not merely one
+# per process. Without it, a second backend (a stray `uvicorn`, or more than
+# one deployed instance) would index concurrently and the one-at-a-time
+# guarantee would quietly not hold. Postgres drops the lock automatically if
+# the session ends, so a crashed worker does not wedge the queue.
+WORKER_LOCK_KEY = 8412771  # arbitrary, just needs to be unique to this app
 
 
 def enqueue_job(repository_id: int, db) -> IndexJob:
@@ -37,17 +46,25 @@ def enqueue_job(repository_id: int, db) -> IndexJob:
         )
         .order_by(IndexJob.created_at)
     )
+    repository = db.get(Repository, repository_id)
+    name = repository.name if repository else f"id={repository_id}"
+
     if existing is not None:
+        logger.info(
+            "already %s as job %d, not queueing again: %s",
+            existing.status.value,
+            existing.id,
+            name,
+        )
         return existing
 
     job = IndexJob(repository_id=repository_id)
     db.add(job)
-
-    repository = db.get(Repository, repository_id)
     if repository is not None:
         repository.index_status = IndexStatus.INDEXING
     db.commit()
     db.refresh(job)
+    logger.info("queued job %d for %s (position %d)", job.id, name, queue_position(job, db))
     return job
 
 
@@ -111,64 +128,104 @@ def _reset_orphaned_jobs() -> None:
         db.commit()
 
 
-def _claim_next_job() -> int | None:
+def _claim_next_job(db) -> int | None:
     """
-    Take the oldest queued job. SKIP LOCKED means that if this ever runs as
-    more than one process, two workers cannot claim the same job.
+    Take the oldest queued job. SKIP LOCKED means two workers racing here
+    cannot claim the same row even before the advisory lock is considered.
+    """
+    job = db.scalar(
+        select(IndexJob)
+        .where(IndexJob.status == JobStatus.QUEUED)
+        .order_by(IndexJob.created_at)
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+    if job is None:
+        return None
+    job.status = JobStatus.RUNNING
+    job.started_at = datetime.now(timezone.utc)
+    job.attempts += 1
+    db.commit()
+    return job.id
+
+
+def _claim_and_run_one() -> str:
+    """
+    One turn of the worker: take the global lock, run at most one job, then
+    release. Returns what happened so the loop knows whether to sleep.
     """
     with SessionLocal() as db:
-        job = db.scalar(
-            select(IndexJob)
-            .where(IndexJob.status == JobStatus.QUEUED)
-            .order_by(IndexJob.created_at)
-            .limit(1)
-            .with_for_update(skip_locked=True)
-        )
-        if job is None:
-            return None
-        job.status = JobStatus.RUNNING
-        job.started_at = datetime.now(timezone.utc)
-        job.attempts += 1
-        db.commit()
-        return job.id
-
-
-def _run_job(job_id: int) -> None:
-    with SessionLocal() as db:
-        job = db.get(IndexJob, job_id)
-        if job is None:
-            return
-        repository = db.get(Repository, job.repository_id)
-        if repository is None:
-            job.status = JobStatus.FAILED
-            job.error = "Repository no longer exists"
-            job.finished_at = datetime.now(timezone.utc)
-            db.commit()
-            return
-
-        owner = db.get(User, repository.user_id)
-        token = owner.access_token if owner else None
-
+        acquired = db.execute(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": WORKER_LOCK_KEY}
+        ).scalar()
+        if not acquired:
+            return "busy_elsewhere"
         try:
-            result = index_repository(repository, token, db)
-        except Exception as exc:
-            logger.exception("Indexing failed for repository %s", repository.id)
-            db.rollback()
-            job.status = JobStatus.FAILED
-            job.error = str(exc)[:2000]
-            job.finished_at = datetime.now(timezone.utc)
-            repository.index_status = IndexStatus.FAILED
+            job_id = _claim_next_job(db)
+            if job_id is None:
+                return "empty"
+            _run_job(job_id, db)
+            return "ran"
+        finally:
+            db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": WORKER_LOCK_KEY})
             db.commit()
-            return
 
-        job.status = JobStatus.SUCCEEDED
-        job.files_indexed = result.files_indexed
-        job.symbols_found = result.symbols_found
-        job.calls_found = result.calls_found
+
+def _run_job(job_id: int, db) -> None:
+    job = db.get(IndexJob, job_id)
+    if job is None:
+        return
+    repository = db.get(Repository, job.repository_id)
+    if repository is None:
+        job.status = JobStatus.FAILED
+        job.error = "Repository no longer exists"
         job.finished_at = datetime.now(timezone.utc)
-        repository.index_status = IndexStatus.INDEXED
-        repository.indexed_at = datetime.now(timezone.utc)
         db.commit()
+        return
+
+    owner = db.get(User, repository.user_id)
+    token = owner.access_token if owner else None
+
+    logger.info(
+        "starting job %d for %s (attempt %d of %d)",
+        job.id,
+        repository.name,
+        job.attempts,
+        MAX_ATTEMPTS,
+    )
+    started = time.monotonic()
+
+    try:
+        result = index_repository(repository, token, db)
+    except Exception as exc:
+        logger.exception("job %d FAILED for %s: %s", job.id, repository.name, exc)
+        db.rollback()
+        job.status = JobStatus.FAILED
+        job.error = str(exc)[:2000]
+        job.finished_at = datetime.now(timezone.utc)
+        repository.index_status = IndexStatus.FAILED
+        db.commit()
+        return
+
+    job.status = JobStatus.SUCCEEDED
+    job.files_indexed = result.files_indexed
+    job.symbols_found = result.symbols_found
+    job.calls_found = result.calls_found
+    job.finished_at = datetime.now(timezone.utc)
+    repository.index_status = IndexStatus.INDEXED
+    repository.indexed_at = datetime.now(timezone.utc)
+    db.commit()
+
+    remaining = len(
+        db.scalars(select(IndexJob).where(IndexJob.status == JobStatus.QUEUED)).all()
+    )
+    logger.info(
+        "job %d SUCCEEDED for %s in %.1fs; %d job(s) left in queue",
+        job.id,
+        repository.name,
+        time.monotonic() - started,
+        remaining,
+    )
 
 
 async def worker_loop(stop_event: asyncio.Event) -> None:
@@ -180,19 +237,20 @@ async def worker_loop(stop_event: asyncio.Event) -> None:
     The blocking work runs in a thread so the event loop, and therefore the
     rest of the API, stays responsive while a repository is being indexed.
     """
+    logger.info("index worker started, draining queue one repository at a time")
     await asyncio.to_thread(_reset_orphaned_jobs)
 
     while not stop_event.is_set():
         try:
-            job_id = await asyncio.to_thread(_claim_next_job)
-            if job_id is None:
-                # Wake early if asked to stop, rather than always sleeping.
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=IDLE_POLL_SECONDS)
-                except asyncio.TimeoutError:
-                    pass
-                continue
-            await asyncio.to_thread(_run_job, job_id)
+            outcome = await asyncio.to_thread(_claim_and_run_one)
+            if outcome == "ran":
+                continue  # go straight for the next job, no need to wait
+            # Nothing to do, or another process is holding the worker lock.
+            # Wake early if asked to stop, rather than always sleeping.
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=IDLE_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
         except asyncio.CancelledError:
             raise
         except Exception:

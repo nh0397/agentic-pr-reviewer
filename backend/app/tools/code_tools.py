@@ -100,26 +100,34 @@ def find_callers(symbol_id: int, db: Session, limit: int = DEFAULT_LIMIT) -> lis
     """
     caller = aliased(CodeSymbol)
     rows = db.execute(
-        select(caller, CodeFile.path)
+        select(caller, CodeFile.path, SymbolCall.kind)
         .join(SymbolCall, SymbolCall.caller_id == caller.id)
         .join(CodeFile, caller.file_id == CodeFile.id)
         .where(SymbolCall.callee_id == symbol_id)
+        .order_by(SymbolCall.kind)  # calls before bare references
         .limit(limit)
     ).all()
-    return [CallRelation(symbol=_to_ref(s, path), via_path=path) for s, path in rows]
+    return [
+        CallRelation(symbol=_to_ref(s, path), kind=kind.value, via_path=path)
+        for s, path, kind in rows
+    ]
 
 
 def find_callees(symbol_id: int, db: Session, limit: int = DEFAULT_LIMIT) -> list[CallRelation]:
     """What this symbol depends on, i.e. what it could break against."""
     callee = aliased(CodeSymbol)
     rows = db.execute(
-        select(callee, CodeFile.path)
+        select(callee, CodeFile.path, SymbolCall.kind)
         .join(SymbolCall, SymbolCall.callee_id == callee.id)
         .join(CodeFile, callee.file_id == CodeFile.id)
         .where(SymbolCall.caller_id == symbol_id)
+        .order_by(SymbolCall.kind)
         .limit(limit)
     ).all()
-    return [CallRelation(symbol=_to_ref(s, path), via_path=path) for s, path in rows]
+    return [
+        CallRelation(symbol=_to_ref(s, path), kind=kind.value, via_path=path)
+        for s, path, kind in rows
+    ]
 
 
 def read_symbol(symbol_id: int, db: Session, source_lookup=None) -> SymbolSource | None:

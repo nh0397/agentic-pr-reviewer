@@ -23,5 +23,9 @@ class SymbolSource(SymbolRef):
 
 class CallRelation(BaseModel):
     symbol: SymbolRef
+    # "call" means invoked; "reference" means used without being invoked,
+    # e.g. passed as an argument or named as a type. Both matter for impact,
+    # but the agent should be able to tell them apart when it reasons.
+    kind: str
     # Where the relationship was observed, useful for the agent to cite.
     via_path: str

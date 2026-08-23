@@ -15,8 +15,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # Not used by the backend until the indexing phase, included now so the
-  # local environment already matches the target architecture.
   qdrant:
     image: qdrant/qdrant:latest
     ports:
@@ -24,7 +22,15 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  # The backend deliberately does NOT run here by default. Compose provides
+  # infrastructure only; the backend runs locally with `uvicorn --reload`
+  # against these published ports. One way to run it means no second copy
+  # to keep in sync and no stale image serving old code.
+  #
+  # `docker compose --profile full up -d` runs it in a container instead,
+  # which is the path that mirrors deployment.
   backend:
+    profiles: ["full"]
     build: ./backend
     env_file:
       - ./backend/.env

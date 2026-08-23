@@ -39,6 +39,10 @@ class IndexJobRead(BaseModel):
     status: str
     # 0 while running or next in line, higher the further back it is.
     queue_position: int
+    phase: str | None = None
+    detail: str | None = None
+    progress_current: int | None = None
+    progress_total: int | None = None
     error: str | None = None
     files_indexed: int | None = None
     symbols_found: int | None = None

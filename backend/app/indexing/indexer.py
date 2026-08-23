@@ -1,5 +1,6 @@
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
@@ -19,6 +20,11 @@ logger = logging.getLogger("indexing")
 PROGRESS_EVERY_N_FILES = 25
 
 
+# Reported to the caller as the run moves through its stages, so progress
+# can be surfaced without the caller knowing how indexing works internally.
+ProgressCallback = Callable[..., None]
+
+
 @dataclass
 class IndexResult:
     files_indexed: int
@@ -26,9 +32,19 @@ class IndexResult:
     calls_found: int
 
 
-def index_repository(repository: Repository, access_token: str | None, db: Session) -> IndexResult:
+def index_repository(
+    repository: Repository,
+    access_token: str | None,
+    db: Session,
+    on_progress: ProgressCallback | None = None,
+) -> IndexResult:
+    def report(phase: str, detail: str, current: int | None = None, total: int | None = None):
+        if on_progress is not None:
+            on_progress(phase=phase, detail=detail, current=current, total=total)
+
     started = time.monotonic()
     logger.info("[%s] clearing any previous index", repository.name)
+    report("preparing", "Clearing any previous index")
     _clear_existing_index(repository.id, db)
 
     # Accumulated across every file in the repo, not reset per file, so a
@@ -44,12 +60,14 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
 
     # Never log the authenticated clone URL; it carries the access token.
     logger.info("[%s] cloning %s", repository.name, repository.github_url)
+    report("cloning", "Cloning the repository from GitHub")
     clone_started = time.monotonic()
 
     with cloned_repo(repository.github_url, access_token) as repo_path:
         logger.info(
             "[%s] cloned in %.1fs, walking files", repository.name, time.monotonic() - clone_started
         )
+        report("parsing", "Scanning files")
         parse_started = time.monotonic()
         files_seen = 0
         files_skipped = 0
@@ -63,6 +81,12 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
                     files_seen,
                     files_indexed,
                     len(embedding_symbol_ids),
+                )
+                # No total here: the file count is only known once the walk
+                # finishes, so this phase reports a count, not a percentage.
+                report(
+                    "parsing",
+                    f"Scanned {files_seen} files, found {len(embedding_symbol_ids)} symbols",
                 )
 
             try:
@@ -115,6 +139,7 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
         f", {files_skipped} unreadable" if files_skipped else "",
     )
 
+    report("resolving", f"Linking {len(pending_calls)} call sites")
     calls_found = 0
     unresolved = 0
     seen_edges: set[tuple[int, int]] = set()
@@ -145,7 +170,13 @@ def index_repository(repository: Repository, access_token: str | None, db: Sessi
     if embedding_texts:
         logger.info("[%s] embedding %d symbols...", repository.name, len(embedding_texts))
         embed_started = time.monotonic()
-        vectors = embed_texts(embedding_texts)
+
+        def embedding_progress(done: int, total: int) -> None:
+            report("embedding", f"Embedded {done} of {total} symbols", done, total)
+
+        report("embedding", f"Embedded 0 of {len(embedding_texts)} symbols", 0, len(embedding_texts))
+        vectors = embed_texts(embedding_texts, on_progress=embedding_progress)
+        report("storing", f"Storing {len(vectors)} vectors")
         points = [
             (symbol_id, vector, {"repository_id": repository.id, "symbol_id": symbol_id})
             for symbol_id, vector in zip(embedding_symbol_ids, vectors)

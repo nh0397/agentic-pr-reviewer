@@ -39,6 +39,14 @@ class IndexJob(Base):
     # and never surface an error.
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # Live progress, written as the job runs so the UI can show what is
+    # happening instead of an indefinite spinner. `phase` drives the label,
+    # and current/total drive a progress bar when the phase can be measured.
+    phase: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    detail: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    progress_current: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    progress_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     files_indexed: Mapped[int | None] = mapped_column(Integer, nullable=True)
     symbols_found: Mapped[int | None] = mapped_column(Integer, nullable=True)

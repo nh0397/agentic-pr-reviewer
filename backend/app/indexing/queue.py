@@ -7,6 +7,7 @@ from sqlalchemy import select, text
 
 from app.db.session import SessionLocal
 from app.indexing.indexer import index_repository
+from app.models.code_graph import CodeFile
 from app.models.index_job import IndexJob, JobStatus
 from app.models.repository import IndexStatus, Repository
 from app.models.user import User
@@ -128,6 +129,40 @@ def _reset_orphaned_jobs() -> None:
         db.commit()
 
 
+def _reconcile_stuck_repositories() -> None:
+    """
+    A repository marked INDEXING with no queued or running job would show a
+    spinner forever, since nothing is left to move it on. Put it back to a
+    truthful state: INDEXED if an index exists for it, otherwise NOT_INDEXED.
+    """
+    with SessionLocal() as db:
+        active_repo_ids = select(IndexJob.repository_id).where(
+            IndexJob.status.in_([JobStatus.QUEUED, JobStatus.RUNNING])
+        )
+        stuck = db.scalars(
+            select(Repository).where(
+                Repository.index_status == IndexStatus.INDEXING,
+                Repository.id.notin_(active_repo_ids),
+            )
+        ).all()
+        if not stuck:
+            return
+
+        for repository in stuck:
+            has_index = db.scalar(
+                select(CodeFile.id).where(CodeFile.repository_id == repository.id).limit(1)
+            )
+            repository.index_status = (
+                IndexStatus.INDEXED if has_index else IndexStatus.NOT_INDEXED
+            )
+            logger.info(
+                "reset %s from indexing to %s (no active job)",
+                repository.name,
+                repository.index_status.value,
+            )
+        db.commit()
+
+
 def _claim_next_job(db) -> int | None:
     """
     Take the oldest queued job. SKIP LOCKED means two workers racing here
@@ -195,11 +230,32 @@ def _run_job(job_id: int, db) -> None:
     )
     started = time.monotonic()
 
+    def record_progress(phase: str, detail: str, current=None, total=None) -> None:
+        # A short, separate session on purpose: the indexing session has a
+        # long transaction open, so writing progress through it would not be
+        # visible to the API until indexing committed, which is exactly when
+        # the progress stops being useful.
+        try:
+            with SessionLocal() as progress_db:
+                progress_db.query(IndexJob).filter(IndexJob.id == job_id).update(
+                    {
+                        "phase": phase,
+                        "detail": detail[:300],
+                        "progress_current": current,
+                        "progress_total": total,
+                    }
+                )
+                progress_db.commit()
+        except Exception:
+            # Progress reporting must never take the job down with it.
+            logger.warning("could not record progress for job %d", job_id, exc_info=True)
+
     try:
-        result = index_repository(repository, token, db)
+        result = index_repository(repository, token, db, on_progress=record_progress)
     except Exception as exc:
         logger.exception("job %d FAILED for %s: %s", job.id, repository.name, exc)
         db.rollback()
+        db.refresh(job)
         job.status = JobStatus.FAILED
         job.error = str(exc)[:2000]
         job.finished_at = datetime.now(timezone.utc)
@@ -207,10 +263,18 @@ def _run_job(job_id: int, db) -> None:
         db.commit()
         return
 
+    # Re-read after the progress writes above, which changed the row from a
+    # different session; without this the stale in-session copy would undo
+    # them and could clobber the status we are about to set.
+    db.refresh(job)
     job.status = JobStatus.SUCCEEDED
     job.files_indexed = result.files_indexed
     job.symbols_found = result.symbols_found
     job.calls_found = result.calls_found
+    job.phase = None
+    job.detail = None
+    job.progress_current = None
+    job.progress_total = None
     job.finished_at = datetime.now(timezone.utc)
     repository.index_status = IndexStatus.INDEXED
     repository.indexed_at = datetime.now(timezone.utc)
@@ -239,6 +303,7 @@ async def worker_loop(stop_event: asyncio.Event) -> None:
     """
     logger.info("index worker started, draining queue one repository at a time")
     await asyncio.to_thread(_reset_orphaned_jobs)
+    await asyncio.to_thread(_reconcile_stuck_repositories)
 
     while not stop_event.is_set():
         try:

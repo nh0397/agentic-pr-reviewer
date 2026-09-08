@@ -7,9 +7,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.api.routes import auth, github, health, indexing, pull_requests, repositories
+from app.api.routes import (
+    auth,
+    github,
+    health,
+    indexing,
+    pull_requests,
+    repositories,
+    reviews,
+)
 from app.config import get_settings
 from app.db.session import engine
+from app.indexing.embeddings import warm_embedding_model
 from app.indexing.queue import worker_loop
 from app.logging_config import configure_logging
 
@@ -35,6 +44,10 @@ async def lifespan(app: FastAPI):
             "Start it first, from the project root:\n\n"
             "    docker compose up -d\n"
         )
+
+    # Download/load the embedding model now rather than during the first
+    # search, off the event loop so startup is not blocked on it.
+    asyncio.create_task(asyncio.to_thread(warm_embedding_model))
 
     # One worker drains the index queue for the lifetime of the app.
     stop_event = asyncio.Event()
@@ -73,3 +86,4 @@ app.include_router(github.router)
 app.include_router(repositories.router)
 app.include_router(indexing.router)
 app.include_router(pull_requests.router)
+app.include_router(reviews.router)

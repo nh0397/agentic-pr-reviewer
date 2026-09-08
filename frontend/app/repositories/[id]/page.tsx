@@ -23,6 +23,13 @@ type RepositoryGraph = {
   edges: GraphEdge[];
 };
 
+type PullRequestSummary = {
+  number: number;
+  title: string;
+  author: string;
+  draft: boolean;
+};
+
 type Repository = {
   id: number;
   name: string;
@@ -45,6 +52,8 @@ export default function RepositoryDetailPage({
   const [graph, setGraph] = useState<RepositoryGraph | null>(null);
   const [loading, setLoading] = useState(true);
   const [job, setJob] = useState<IndexJob | null>(null);
+  const [pulls, setPulls] = useState<PullRequestSummary[]>([]);
+  const [pullsError, setPullsError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const indexing = job?.status === "queued" || job?.status === "running";
@@ -67,6 +76,24 @@ export default function RepositoryDetailPage({
       // Picks up a job already in flight, e.g. queued from the dashboard
       // before navigating here.
       if (jobRes.ok) setJob(await jobRes.json());
+
+      // Separate from the batch above: GitHub can rate limit or the repo may
+      // have no PR access, and that should not blank the whole page.
+      try {
+        const pullsRes = await fetch(
+          `${API_BASE_URL}/api/repositories/${id}/pulls`,
+          fetchOpts
+        );
+        if (pullsRes.ok) {
+          setPulls(await pullsRes.json());
+          setPullsError(null);
+        } else {
+          const body = await pullsRes.json().catch(() => ({}));
+          setPullsError(body.detail ?? "Could not load pull requests from GitHub.");
+        }
+      } catch {
+        setPullsError("Could not load pull requests from GitHub.");
+      }
     } catch {
       setError("Could not reach the backend.");
     } finally {
@@ -183,6 +210,38 @@ export default function RepositoryDetailPage({
                 </div>
               </div>
             )}
+
+            <div className="mt-10">
+              <h2 className="text-lg font-medium text-black dark:text-zinc-50">
+                Open pull requests
+              </h2>
+              {pullsError ? (
+                <p className="mt-2 text-sm text-zinc-500">{pullsError}</p>
+              ) : pulls.length === 0 ? (
+                <p className="mt-2 text-sm text-zinc-500">No open pull requests.</p>
+              ) : (
+                <div className="mt-4 flex flex-col gap-2">
+                  {pulls.map((pr) => (
+                    <Link
+                      key={pr.number}
+                      href={`/repositories/${id}/pulls/${pr.number}`}
+                      className="flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3 transition hover:border-zinc-300 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-zinc-700"
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate font-medium text-black dark:text-zinc-50">
+                          {pr.title}
+                        </p>
+                        <p className="mt-0.5 text-xs text-zinc-500">
+                          #{pr.number} by {pr.author}
+                          {pr.draft ? " · draft" : ""}
+                        </p>
+                      </div>
+                      <span className="shrink-0 text-sm text-zinc-400">Review &rarr;</span>
+                    </Link>
+                  ))}
+                </div>
+              )}
+            </div>
 
             <div className="mt-10">
               <h2 className="text-lg font-medium text-black dark:text-zinc-50">Call graph</h2>

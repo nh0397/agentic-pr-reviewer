@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     # Ceiling on tool-calling rounds in one review. Without it a model that
     # keeps asking for tools would loop until the rate limit stops it.
     agent_max_steps: int = 12
+    # Roughly how many characters of prompt one request may carry. Groq's
+    # free tier allows 8000 tokens per minute, and every step resends the
+    # whole conversation, so this has to stay well under that (~4 chars per
+    # token). Raise it on a paid tier.
+    agent_max_prompt_chars: int = 14000
+    # Share of that budget the diff itself may take, leaving room for the
+    # system prompt, tool definitions and accumulated tool results.
+    agent_max_diff_chars: int = 6000
 
 
 @lru_cache

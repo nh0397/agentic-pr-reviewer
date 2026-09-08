@@ -162,7 +162,8 @@ def review_pull_request(
             "role": "user",
             "content": (
                 "Review this pull request. Investigate with the tools as needed, "
-                "then reply with the JSON object.\n\n" + _format_diff(pull_request)
+                "then reply with the JSON object.\n\n"
+                + _format_diff(pull_request, max_total_chars=settings.agent_max_diff_chars)
             ),
         },
     ]
@@ -171,6 +172,7 @@ def review_pull_request(
     started = time.monotonic()
 
     for step in range(1, settings.agent_max_steps + 1):
+        messages = _trim_history(messages, settings.agent_max_prompt_chars)
         response = llm.chat(messages, tools=TOOL_DEFINITIONS)
         prompt_tokens += response.prompt_tokens
         completion_tokens += response.completion_tokens
@@ -256,6 +258,37 @@ def review_pull_request(
     result.completion_tokens = completion_tokens + final.completion_tokens
     result.raw_response = final.text
     return result
+
+
+def _history_chars(messages: list[dict[str, Any]]) -> int:
+    return sum(len(str(m.get("content") or "")) for m in messages)
+
+
+def _trim_history(messages: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+    """
+    Shrink the conversation to fit the budget by shortening the oldest tool
+    results first. Their content is replaced rather than removed, because a
+    tool message must stay paired with the assistant turn that asked for it;
+    dropping one outright makes the next request invalid.
+
+    The system prompt and the diff are never touched: those are the task.
+    """
+    if _history_chars(messages) <= budget:
+        return messages
+
+    trimmed = [dict(m) for m in messages]
+    for message in trimmed:
+        if _history_chars(trimmed) <= budget:
+            break
+        if message.get("role") != "tool":
+            continue
+        content = str(message.get("content") or "")
+        if len(content) <= 200:
+            continue
+        message["content"] = (
+            content[:200] + f"... (trimmed, {len(content) - 200} characters of this result dropped)"
+        )
+    return trimmed
 
 
 def _short_args(arguments: dict[str, Any], limit: int = 60) -> str:

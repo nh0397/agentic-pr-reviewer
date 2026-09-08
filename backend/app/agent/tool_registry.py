@@ -152,8 +152,18 @@ class ToolExecutor:
         # Kept so a finding can cite what evidence it was based on.
         self.calls_made: list[dict[str, Any]] = []
         self._failures: dict[str, int] = {}
+        self._seen: dict[str, str] = {}
 
     def run(self, name: str, arguments: dict[str, Any]) -> str:
+        # Identical repeat calls are common once history trimming drops an
+        # earlier result: the model forgets it already looked and asks again,
+        # spending a step and a rate-limit window on nothing. Answer from the
+        # first result and say so.
+        signature = json.dumps({"tool": name, "args": arguments}, sort_keys=True, default=str)
+        if signature in self._seen:
+            logger.info("repeat call to %s, answering from the earlier result", name)
+            return self._seen[signature]
+
         # A tool that keeps failing for an environmental reason (the vector
         # store being unreachable, say) will otherwise absorb the whole step
         # budget as the model patiently retries it with new phrasings.
@@ -181,7 +191,9 @@ class ToolExecutor:
             result = {"error": f"{type(exc).__name__}: {exc}"}
 
         self.calls_made.append({"tool": name, "arguments": arguments, "result": result})
-        return json.dumps(result, default=str)
+        payload = json.dumps(result, default=str)
+        self._seen[signature] = payload
+        return payload
 
     def _dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "search_code":

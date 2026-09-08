@@ -6,12 +6,21 @@ is a config change rather than a rewrite. That matters here specifically
 because we are on a free tier whose available models change over time.
 """
 
+import logging
+import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from groq import BadRequestError, Groq
+from groq import BadRequestError, Groq, RateLimitError
 
 from app.config import get_settings
+
+logger = logging.getLogger("agent.llm")
+
+# Groq reports a 413 for an oversized request as a rate-limit error too, so
+# a bounded default keeps a genuine oversize from sleeping for minutes.
+MAX_RETRY_WAIT_SECONDS = 65.0
 
 
 @dataclass
@@ -67,10 +76,27 @@ class GroqClient:
             response = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                tools=tools or None,
-                tool_choice="auto" if tools else None,
                 temperature=temperature,
+                # tool_choice must be omitted entirely when no tools are
+                # sent; passing null is rejected as an invalid value.
+                **({"tools": tools, "tool_choice": "auto"} if tools else {}),
             )
+        except RateLimitError as exc:
+            # Free tiers cap tokens per minute, and every step resends the
+            # whole conversation, so this is a normal condition rather than
+            # an exceptional one. Wait for the window and try once more.
+            wait = _retry_after_seconds(exc)
+            logger.warning("rate limited by the model provider, waiting %.0fs", wait)
+            time.sleep(wait)
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                # tool_choice must be omitted entirely when no tools are
+                # sent; passing null is rejected as an invalid value.
+                **({"tools": tools, "tool_choice": "auto"} if tools else {}),
+            )
+            return _to_response(response)
         except BadRequestError as exc:
             # Groq validates tool arguments against the schema server-side and
             # returns 400 when the model gets them wrong. That is the model's
@@ -81,25 +107,38 @@ class GroqClient:
                 raise
             return LLMResponse(tool_error=detail)
 
-        choice = response.choices[0].message
-        usage = response.usage
+        return _to_response(response)
 
-        calls: list[ToolCall] = []
-        for call in choice.tool_calls or []:
-            calls.append(
-                ToolCall(
-                    id=call.id,
-                    name=call.function.name,
-                    arguments=_parse_arguments(call.function.arguments),
-                )
-            )
 
-        return LLMResponse(
-            text=choice.content,
-            tool_calls=calls,
-            prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-            completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+def _to_response(response) -> LLMResponse:
+    choice = response.choices[0].message
+    usage = response.usage
+    calls = [
+        ToolCall(
+            id=call.id,
+            name=call.function.name,
+            arguments=_parse_arguments(call.function.arguments),
         )
+        for call in (choice.tool_calls or [])
+    ]
+    return LLMResponse(
+        text=choice.content,
+        tool_calls=calls,
+        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+        completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+    )
+
+
+def _retry_after_seconds(exc: Exception) -> float:
+    """Prefer the wait the provider asks for; fall back to a full window."""
+    message = str(exc)
+    match = re.search(r"try again in ([\d.]+)s", message)
+    if match:
+        try:
+            return min(float(match.group(1)) + 1.0, MAX_RETRY_WAIT_SECONDS)
+        except ValueError:
+            pass
+    return MAX_RETRY_WAIT_SECONDS
 
 
 def _tool_use_error(exc: BadRequestError) -> str | None:

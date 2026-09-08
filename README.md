@@ -32,27 +32,16 @@ managed cloud services.
 
 Requires Docker and Node 18+ for the frontend (built against Node 20).
 
-```bash
-docker compose up -d --build
-```
+Docker runs the infrastructure only (Postgres and Qdrant). The backend
+runs locally, so code changes reload instantly with no image rebuild.
 
-This starts Postgres, Qdrant, and the FastAPI backend on port 8000, and
-runs the Alembic migration automatically on startup.
-
-Then, in a separate terminal, start the frontend:
+**1. Infrastructure** (needs Docker Desktop running):
 
 ```bash
-cd frontend
-cp .env.local.example .env.local
-npm install
-npm run dev
+docker compose up -d
 ```
 
-Open http://localhost:3000. Adding a repository by name and GitHub URL
-and seeing it appear in the list confirms the frontend, backend, and
-database are wired together correctly.
-
-## Backend development without Docker
+**2. Backend** (first time: create the venv and install first):
 
 ```bash
 cd backend
@@ -63,6 +52,26 @@ cp .env.example .env
 alembic upgrade head
 uvicorn app.main:app --reload
 ```
+
+After the first time, only the last two lines are needed. If Postgres
+is not running, the backend exits immediately with a message saying so
+rather than failing on every request.
+
+**3. Frontend**, in a separate terminal:
+
+```bash
+cd frontend
+cp .env.local.example .env.local
+npm install
+npm run dev
+```
+
+Open http://localhost:3000.
+
+Docker Compose runs Postgres and Qdrant only. The backend is not a Compose
+service: running it locally means no image to rebuild on every code change,
+and only one copy of it to keep track of. `backend/Dockerfile` is what
+builds it for deployment.
 
 ## Not built yet
 

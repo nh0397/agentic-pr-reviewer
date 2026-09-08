@@ -1,3 +1,6 @@
+# Infrastructure only. The backend runs locally with `uvicorn --reload`
+# against these published ports, so there is one way to run it and no image
+# to rebuild on every code change. Deployment uses backend/Dockerfile.
 services:
   postgres:
     image: postgres:16-alpine
@@ -15,31 +18,15 @@ services:
       timeout: 5s
       retries: 5
 
-  # Not used by the backend until the indexing phase, included now so the
-  # local environment already matches the target architecture.
   qdrant:
-    image: qdrant/qdrant:latest
+    # Pinned, not :latest. The client library checks that its version is
+    # close to the server's, so a floating server tag eventually drifts far
+    # enough to start warning (or breaking) with no change on our side.
+    image: qdrant/qdrant:v1.15.1
     ports:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
-
-  backend:
-    build: ./backend
-    env_file:
-      - ./backend/.env
-    environment:
-      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/pr_reviewer
-      QDRANT_URL: http://qdrant:6333
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./backend:/app
-    depends_on:
-      postgres:
-        condition: service_healthy
-    command: >
-      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 
 volumes:
   postgres_data:

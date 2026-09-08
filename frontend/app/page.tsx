@@ -1,14 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
-
-type User = {
-  id: number;
-  username: string;
-  avatar_url: string | null;
-};
+import { API_BASE_URL, fetchOpts, useSession } from "./useSession";
+import { IndexProgress, type IndexJob } from "./IndexProgress";
 
 type Repository = {
   id: number;
@@ -25,41 +22,40 @@ type GithubRepo = {
   html_url: string;
   default_branch: string;
   private: boolean;
+  description: string | null;
+  language: string | null;
+  stargazers_count: number;
+  updated_at: string;
 };
 
-// Every call needs this so the session cookie set at login actually gets
-// sent, the frontend (port 3000) and backend (port 8000) are different
-// origins as far as the browser's cookie rules are concerned.
-const fetchOpts: RequestInit = { credentials: "include" };
-
-export default function Home() {
-  const [user, setUser] = useState<User | null>(null);
-  const [checkingSession, setCheckingSession] = useState(true);
+export default function DashboardPage() {
+  const { user, checkingSession, backendUnreachable: sessionUnreachable, logout } = useSession();
+  const router = useRouter();
 
   const [repositories, setRepositories] = useState<Repository[]>([]);
   const [githubRepos, setGithubRepos] = useState<GithubRepo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [connectingRepo, setConnectingRepo] = useState<string | null>(null);
-  const [backendUnreachable, setBackendUnreachable] = useState(false);
+  // Keyed by repository id: several repositories can be queued at once, so
+  // a single "which one is indexing" value would erase the others' state.
+  const [jobs, setJobs] = useState<Record<number, IndexJob>>({});
+  const [dataUnreachable, setDataUnreachable] = useState(false);
 
-  async function loadSession() {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/auth/me`, fetchOpts);
-      setUser(res.ok ? await res.json() : null);
-      setBackendUnreachable(false);
-    } catch {
-      setBackendUnreachable(true);
-    } finally {
-      setCheckingSession(false);
+  useEffect(() => {
+    // Same rule as the login page: only redirect once we actually know
+    // you're not logged in. A backend outage also leaves `user` null, but
+    // that should show an error here, not send you bouncing to /login.
+    if (!checkingSession && !user && !sessionUnreachable) {
+      router.replace("/login");
     }
-  }
+  }, [checkingSession, user, sessionUnreachable, router]);
 
   async function loadRepositories() {
     try {
       const res = await fetch(`${API_BASE_URL}/api/repositories`, fetchOpts);
       if (res.ok) setRepositories(await res.json());
     } catch {
-      setBackendUnreachable(true);
+      setDataUnreachable(true);
     }
   }
 
@@ -68,20 +64,45 @@ export default function Home() {
       const res = await fetch(`${API_BASE_URL}/api/github/repos`, fetchOpts);
       if (res.ok) setGithubRepos(await res.json());
     } catch {
-      setBackendUnreachable(true);
+      setDataUnreachable(true);
     }
   }
 
-  useEffect(() => {
-    loadSession();
-  }, []);
+  async function loadJobs() {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/index/jobs`, fetchOpts);
+      if (!res.ok) return [];
+      const active: IndexJob[] = await res.json();
+      setJobs(Object.fromEntries(active.map((job) => [job.repository_id, job])));
+      return active;
+    } catch {
+      setDataUnreachable(true);
+      return [];
+    }
+  }
 
   useEffect(() => {
     if (user) {
       loadRepositories();
       loadGithubRepos();
+      loadJobs();
     }
   }, [user]);
+
+  const hasActiveJobs = Object.keys(jobs).length > 0;
+
+  useEffect(() => {
+    // Only poll while something is actually queued or running, so an idle
+    // dashboard is not hitting the API every second forever.
+    if (!user || !hasActiveJobs) return;
+    const timer = setInterval(async () => {
+      const active = await loadJobs();
+      // A job leaving the active list means it finished, so pick up the
+      // repository's new status and counts.
+      if (active.length === 0) loadRepositories();
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [user, hasActiveJobs]);
 
   async function connectRepo(repo: GithubRepo) {
     setConnectingRepo(repo.full_name);
@@ -109,47 +130,68 @@ export default function Home() {
     }
   }
 
-  async function logout() {
-    await fetch(`${API_BASE_URL}/api/auth/logout`, { ...fetchOpts, method: "POST" });
-    setUser(null);
-    setRepositories([]);
-    setGithubRepos([]);
+  async function indexRepo(repo: Repository) {
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/${repo.id}/index`, {
+        ...fetchOpts,
+        method: "POST",
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(body.detail ?? `Backend responded with ${res.status}`);
+      }
+      // Returns immediately with a queued job; the poller takes it from here.
+      setJobs((current) => ({ ...current, [repo.id]: body as IndexJob }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to queue indexing");
+    }
+  }
+
+  async function handleLogout() {
+    await logout();
+    router.replace("/login");
+  }
+
+  const backendUnreachable = sessionUnreachable || dataUnreachable;
+
+  // Checking the session, or about to redirect: show a small neutral
+  // loading state instead of any page content, so refreshing this route
+  // never flashes the login screen before settling on the dashboard.
+  if (checkingSession || (!user && !backendUnreachable)) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-zinc-50 dark:bg-black">
+        <p className="text-sm text-zinc-500">Loading...</p>
+      </div>
+    );
   }
 
   const connectedUrls = new Set(repositories.map((r) => r.github_url));
 
-  if (!user) {
-    return (
-      <LandingPage
-        checkingSession={checkingSession}
-        backendUnreachable={backendUnreachable}
-        apiBaseUrl={API_BASE_URL}
-      />
-    );
-  }
-
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-black">
-      <main className="mx-auto max-w-2xl px-6 py-16">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-semibold text-black dark:text-zinc-50">
-              Agentic PR Reviewer
-            </h1>
-            <p className="mt-2 text-zinc-600 dark:text-zinc-400">
-              Log in with GitHub, then connect a repository to review.
-            </p>
-          </div>
+      <nav className="sticky top-0 z-10 border-b border-zinc-200 bg-white/80 backdrop-blur dark:border-zinc-800 dark:bg-black/80">
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4 lg:px-10">
+          <span className="font-semibold text-black dark:text-zinc-50">Agentic PR Reviewer</span>
           <div className="flex items-center gap-3">
-            {user.avatar_url && (
+            {user?.avatar_url && (
               // eslint-disable-next-line @next/next/no-img-element
               <img src={user.avatar_url} alt={user.username} className="h-8 w-8 rounded-full" />
             )}
-            <button onClick={logout} className="text-sm text-zinc-500 hover:underline">
+            {user && (
+              <span className="text-sm text-zinc-600 dark:text-zinc-400">{user.username}</span>
+            )}
+            <button onClick={handleLogout} className="text-sm text-zinc-500 hover:underline">
               Log out
             </button>
           </div>
         </div>
+      </nav>
+
+      <main className="mx-auto max-w-7xl px-6 py-10 lg:px-10">
+        <p className="text-zinc-600 dark:text-zinc-400">
+          Connect a repository from GitHub to review its pull requests.
+        </p>
 
         {backendUnreachable && (
           <p className="mt-6 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
@@ -167,19 +209,59 @@ export default function Home() {
           {repositories.length === 0 ? (
             <p className="mt-2 text-zinc-500">None connected yet, pick one below.</p>
           ) : (
-            <ul className="mt-4 flex flex-col gap-2">
-              {repositories.map((repo) => (
-                <li
-                  key={repo.id}
-                  className="rounded border border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
-                >
-                  <p className="font-medium text-black dark:text-zinc-50">{repo.name}</p>
-                  <p className="text-xs uppercase tracking-wide text-zinc-400">
-                    {repo.index_status}
-                  </p>
-                </li>
-              ))}
-            </ul>
+            <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              {repositories.map((repo) => {
+                const job = jobs[repo.id];
+                const running = job?.status === "running";
+                const queued = job?.status === "queued";
+                const busy = running || queued;
+                return (
+                  <div
+                    key={repo.id}
+                    className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="truncate font-medium text-black dark:text-zinc-50">
+                        {repo.name}
+                      </p>
+                      <StatusPill
+                        status={queued ? "queued" : running ? "indexing" : repo.index_status}
+                      />
+                    </div>
+                    {busy ? (
+                      <IndexProgress job={job} />
+                    ) : (
+                      <p className="mt-1 text-xs text-zinc-400">
+                        Default branch: {repo.default_branch}
+                      </p>
+                    )}
+                    <div className="mt-3 flex gap-2">
+                      <button
+                        disabled={busy}
+                        onClick={() => indexRepo(repo)}
+                        className="flex-1 rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-black transition disabled:opacity-50 dark:border-zinc-700 dark:text-white"
+                      >
+                        {queued
+                          ? "Queued"
+                          : running
+                            ? "Indexing..."
+                            : repo.index_status === "indexed"
+                              ? "Re-index"
+                              : "Index"}
+                      </button>
+                      {repo.index_status === "indexed" && (
+                        <Link
+                          href={`/repositories/${repo.id}`}
+                          className="flex-1 rounded-lg bg-black px-3 py-1.5 text-center text-sm font-medium text-white transition hover:opacity-90 dark:bg-white dark:text-black"
+                        >
+                          View
+                        </Link>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
 
@@ -187,214 +269,141 @@ export default function Home() {
           <h2 className="text-lg font-medium text-black dark:text-zinc-50">
             Your GitHub repositories
           </h2>
-          <ul className="mt-4 flex flex-col gap-2">
+          <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {githubRepos.map((repo) => {
               const connected = connectedUrls.has(repo.html_url);
               return (
-                <li
+                <div
                   key={repo.full_name}
-                  className="flex items-center justify-between rounded border border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
+                  className="flex flex-col rounded-xl border border-zinc-200 bg-white p-4 shadow-sm transition hover:border-zinc-300 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-zinc-700"
                 >
-                  <div>
-                    <p className="font-medium text-black dark:text-zinc-50">{repo.full_name}</p>
-                    <p className="text-xs text-zinc-400">{repo.private ? "private" : "public"}</p>
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="truncate font-medium text-black dark:text-zinc-50">
+                      {repo.name}
+                    </p>
+                    <span className="shrink-0 rounded-full bg-zinc-100 px-2 py-0.5 text-[11px] font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                      {repo.private ? "Private" : "Public"}
+                    </span>
                   </div>
-                  <button
-                    disabled={connected || connectingRepo === repo.full_name}
-                    onClick={() => connectRepo(repo)}
-                    className="rounded border border-zinc-300 px-3 py-1 text-sm text-black disabled:opacity-50 dark:border-zinc-700 dark:text-white"
-                  >
-                    {connected
-                      ? "Connected"
-                      : connectingRepo === repo.full_name
-                        ? "Connecting..."
-                        : "Connect"}
-                  </button>
-                </li>
+
+                  <p className="mt-1 line-clamp-2 flex-1 text-sm text-zinc-500 dark:text-zinc-400">
+                    {repo.description ?? "No description"}
+                  </p>
+
+                  <div className="mt-4 flex items-center justify-between">
+                    <div className="flex items-center gap-3 text-xs text-zinc-500 dark:text-zinc-400">
+                      {repo.language && (
+                        <span className="flex items-center gap-1.5">
+                          <span
+                            className="h-2.5 w-2.5 rounded-full"
+                            style={{ backgroundColor: languageColor(repo.language) }}
+                          />
+                          {repo.language}
+                        </span>
+                      )}
+                      <span className="flex items-center gap-1">
+                        <StarIcon className="h-3.5 w-3.5" />
+                        {repo.stargazers_count}
+                      </span>
+                      <span>{formatRelativeTime(repo.updated_at)}</span>
+                    </div>
+
+                    <button
+                      disabled={connected || connectingRepo === repo.full_name}
+                      onClick={() => connectRepo(repo)}
+                      className="shrink-0 rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-black transition disabled:opacity-50 dark:border-zinc-700 dark:text-white"
+                    >
+                      {connected
+                        ? "Connected"
+                        : connectingRepo === repo.full_name
+                          ? "Connecting..."
+                          : "Connect"}
+                    </button>
+                  </div>
+                </div>
               );
             })}
-          </ul>
+          </div>
         </div>
       </main>
     </div>
   );
 }
 
-function LandingPage({
-  checkingSession,
-  backendUnreachable,
-  apiBaseUrl,
-}: {
-  checkingSession: boolean;
-  backendUnreachable: boolean;
-  apiBaseUrl: string;
-}) {
+const STATUS_STYLES: Record<string, { label: string; className: string; pulse?: boolean }> = {
+  not_indexed: {
+    label: "Not indexed",
+    className: "bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400",
+  },
+  queued: {
+    label: "Queued",
+    className: "bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-400",
+  },
+  indexing: {
+    label: "Indexing",
+    className: "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400",
+    pulse: true,
+  },
+  indexed: {
+    label: "Indexed",
+    className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400",
+  },
+  failed: {
+    label: "Failed",
+    className: "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-400",
+  },
+};
+
+function StatusPill({ status }: { status: string }) {
+  const style = STATUS_STYLES[status] ?? STATUS_STYLES.not_indexed;
   return (
-    <div className="grid min-h-screen lg:grid-cols-10">
-      {/* Left, 70%: title and the graph animation */}
-      <div className="relative flex flex-col justify-center overflow-hidden bg-zinc-50 px-10 py-20 dark:bg-black lg:col-span-7 lg:px-20">
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-          <DependencyGraphAnimation />
-        </div>
-        <div className="relative z-10 max-w-xl">
-          <p className="text-sm font-medium uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-500">
-            Agentic Code Review
-          </p>
-          <h1 className="mt-4 text-5xl font-semibold tracking-tight text-black dark:text-white">
-            Agentic GitHub
-            <br />
-            PR Reviewer
-          </h1>
-          <p className="mt-6 max-w-md text-lg leading-relaxed text-zinc-600 dark:text-zinc-400">
-            An AI reviewer that investigates your codebase before it writes a single
-            comment: tool calling, dependency graphs, and semantic search, not a diff
-            pasted into a prompt.
-          </p>
-        </div>
-      </div>
-
-      {/* Right, 30%: login */}
-      <div className="flex items-center justify-center border-t border-zinc-200 bg-white px-10 py-20 dark:border-zinc-800 dark:bg-zinc-950 lg:col-span-3 lg:border-l lg:border-t-0">
-        <div className="w-full max-w-xs">
-          <h2 className="text-xl font-semibold text-black dark:text-white">Welcome</h2>
-          <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
-            Log in with GitHub to connect a repository.
-          </p>
-
-          {backendUnreachable && (
-            <p className="mt-6 rounded border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
-              Could not reach the backend at {apiBaseUrl}. Make sure it is running.
-            </p>
-          )}
-
-          {checkingSession ? (
-            <p className="mt-8 text-sm text-zinc-500">Checking session...</p>
-          ) : (
-            <a
-              href={`${apiBaseUrl}/api/auth/github/login`}
-              className="mt-8 flex items-center justify-center gap-2 rounded-lg bg-black px-4 py-3 font-medium text-white transition hover:opacity-90 dark:bg-white dark:text-black"
-            >
-              <GithubMark className="h-5 w-5" />
-              Continue with GitHub
-            </a>
-          )}
-        </div>
-      </div>
-    </div>
+    <span
+      className={`flex shrink-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium ${style.className}`}
+    >
+      <span
+        className={`h-1.5 w-1.5 rounded-full bg-current ${style.pulse ? "animate-pulse" : ""}`}
+      />
+      {style.label}
+    </span>
   );
 }
 
-function GithubMark({ className }: { className?: string }) {
+const LANGUAGE_COLORS: Record<string, string> = {
+  TypeScript: "#3178c6",
+  JavaScript: "#f1e05a",
+  Python: "#3572A5",
+  Go: "#00ADD8",
+  Rust: "#dea584",
+  Java: "#b07219",
+  Ruby: "#701516",
+  "C++": "#f34b7d",
+  C: "#555555",
+  HTML: "#e34c26",
+  CSS: "#563d7c",
+  Shell: "#89e051",
+  PHP: "#4F5D95",
+};
+
+function languageColor(language: string): string {
+  return LANGUAGE_COLORS[language] ?? "#8b8b8b";
+}
+
+function formatRelativeTime(dateString: string): string {
+  const diffMs = new Date(dateString).getTime() - Date.now();
+  const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
+  const formatter = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+  if (Math.abs(diffDays) < 1) {
+    const diffHours = Math.round(diffMs / (1000 * 60 * 60));
+    return formatter.format(diffHours, "hour");
+  }
+  if (Math.abs(diffDays) < 30) return formatter.format(diffDays, "day");
+  return formatter.format(Math.round(diffDays / 30), "month");
+}
+
+function StarIcon({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 16 16" fill="currentColor" className={className} aria-hidden="true">
-      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
-    </svg>
-  );
-}
-
-/**
- * A small dependency graph, gently pulsing and with signal flowing along
- * the edges. Nodes represent code (functions/classes), edges represent
- * calls, this is a literal picture of what the agent actually traverses.
- */
-function DependencyGraphAnimation() {
-  const nodes = [
-    { id: "pr", x: 300, y: 300, r: 14, accent: true },
-    { id: "a", x: 140, y: 160, r: 9 },
-    { id: "b", x: 460, y: 150, r: 9 },
-    { id: "c", x: 130, y: 440, r: 9 },
-    { id: "d", x: 470, y: 450, r: 9 },
-    { id: "e", x: 300, y: 90, r: 7 },
-    { id: "f", x: 300, y: 520, r: 7 },
-  ];
-  const edges: [string, string][] = [
-    ["pr", "a"],
-    ["pr", "b"],
-    ["pr", "c"],
-    ["pr", "d"],
-    ["a", "e"],
-    ["b", "e"],
-    ["c", "f"],
-    ["d", "f"],
-    ["a", "c"],
-    ["b", "d"],
-  ];
-  const byId = Object.fromEntries(nodes.map((n) => [n.id, n]));
-
-  return (
-    <svg
-      viewBox="0 0 600 600"
-      className="h-[110%] w-[110%] max-w-none opacity-70 dark:opacity-60"
-      aria-hidden="true"
-    >
-      <style>{`
-        .pr-graph-edge {
-          stroke: currentColor;
-          stroke-width: 1.5;
-          stroke-dasharray: 6 8;
-          opacity: 0.35;
-          animation: pr-graph-flow 6s linear infinite;
-        }
-        .pr-graph-node {
-          fill: currentColor;
-          transform-origin: center;
-          transform-box: fill-box;
-          animation: pr-graph-pulse 3.2s ease-in-out infinite;
-        }
-        .pr-graph-node-accent {
-          fill: #6366f1;
-          transform-origin: center;
-          transform-box: fill-box;
-          animation: pr-graph-pulse-accent 2.4s ease-in-out infinite;
-        }
-        @keyframes pr-graph-flow {
-          to { stroke-dashoffset: -140; }
-        }
-        @keyframes pr-graph-pulse {
-          0%, 100% { opacity: 0.55; transform: scale(1); }
-          50% { opacity: 1; transform: scale(1.25); }
-        }
-        @keyframes pr-graph-pulse-accent {
-          0%, 100% { opacity: 0.85; transform: scale(1); }
-          50% { opacity: 1; transform: scale(1.15); }
-        }
-      `}</style>
-      <g className="text-zinc-400 dark:text-zinc-600">
-        {edges.map(([from, to], i) => (
-          <line
-            key={i}
-            className="pr-graph-edge"
-            x1={byId[from].x}
-            y1={byId[from].y}
-            x2={byId[to].x}
-            y2={byId[to].y}
-            style={{ animationDelay: `${i * 0.15}s` }}
-          />
-        ))}
-      </g>
-      <g className="text-zinc-500 dark:text-zinc-400">
-        {nodes.map((n, i) =>
-          n.accent ? (
-            <circle
-              key={n.id}
-              className="pr-graph-node-accent"
-              cx={n.x}
-              cy={n.y}
-              r={n.r}
-              style={{ animationDelay: `${i * 0.2}s` }}
-            />
-          ) : (
-            <circle
-              key={n.id}
-              className="pr-graph-node"
-              cx={n.x}
-              cy={n.y}
-              r={n.r}
-              style={{ animationDelay: `${i * 0.2}s` }}
-            />
-          )
-        )}
-      </g>
+      <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.193L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z" />
     </svg>
   );
 }

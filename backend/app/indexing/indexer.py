@@ -1,0 +1,258 @@
+import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from sqlalchemy.orm import Session
+
+from app.indexing.embeddings import embed_texts
+from app.indexing.git import cloned_repo, walk_source_files
+from app.indexing.parser import parse_file
+from app.indexing.vector_store import delete_repository_vectors, upsert_symbol_vectors
+from app.models.code_graph import CodeFile, CodeSymbol, EdgeKind, SymbolCall, SymbolType
+from app.models.repository import Repository
+
+
+logger = logging.getLogger("indexing")
+
+# How often to report progress while walking files. Logging every file is
+# unreadable on a large repository; this gives a steady heartbeat instead.
+PROGRESS_EVERY_N_FILES = 25
+
+
+# Reported to the caller as the run moves through its stages, so progress
+# can be surfaced without the caller knowing how indexing works internally.
+ProgressCallback = Callable[..., None]
+
+
+@dataclass
+class IndexResult:
+    files_indexed: int
+    symbols_found: int
+    calls_found: int
+
+
+def index_repository(
+    repository: Repository,
+    access_token: str | None,
+    db: Session,
+    on_progress: ProgressCallback | None = None,
+) -> IndexResult:
+    def report(phase: str, detail: str, current: int | None = None, total: int | None = None):
+        if on_progress is not None:
+            on_progress(phase=phase, detail=detail, current=current, total=total)
+
+    started = time.monotonic()
+    logger.info("[%s] clearing any previous index", repository.name)
+    report("preparing", "Clearing any previous index")
+    _clear_existing_index(repository.id, db)
+
+    # Accumulated across every file in the repo, not reset per file, so a
+    # call in one file can resolve to a function defined in another. This is
+    # name-based only, not import- or scope-aware: two unrelated functions
+    # sharing a name will incorrectly link. That's a real limitation, full
+    # resolution would need type/import analysis, out of scope for now.
+    name_to_symbol_id: dict[str, int] = {}
+    pending_calls: list[tuple[int, str, EdgeKind]] = []
+    embedding_texts: list[str] = []
+    embedding_symbol_ids: list[int] = []
+    files_indexed = 0
+
+    # Never log the authenticated clone URL; it carries the access token.
+    logger.info("[%s] cloning %s", repository.name, repository.github_url)
+    report("cloning", "Cloning the repository from GitHub")
+    clone_started = time.monotonic()
+
+    with cloned_repo(repository.github_url, access_token) as repo_path:
+        logger.info(
+            "[%s] cloned in %.1fs, walking files", repository.name, time.monotonic() - clone_started
+        )
+        report("parsing", "Scanning files")
+        parse_started = time.monotonic()
+        files_seen = 0
+        files_skipped = 0
+
+        for path in walk_source_files(repo_path):
+            files_seen += 1
+            if files_seen % PROGRESS_EVERY_N_FILES == 0:
+                logger.info(
+                    "[%s] %d files scanned, %d indexed so far (%d symbols)",
+                    repository.name,
+                    files_seen,
+                    files_indexed,
+                    len(embedding_symbol_ids),
+                )
+                # No total here: the file count is only known once the walk
+                # finishes, so this phase reports a count, not a percentage.
+                report(
+                    "parsing",
+                    f"Scanned {files_seen} files, found {len(embedding_symbol_ids)} symbols",
+                )
+
+            try:
+                source = path.read_bytes()
+            except OSError:
+                files_skipped += 1
+                continue
+
+            relative_path = str(path.relative_to(repo_path))
+            result = parse_file(relative_path, source)
+            if result is None or not result.symbols:
+                continue
+
+            code_file = CodeFile(repository_id=repository.id, path=relative_path, language=result.language)
+            db.add(code_file)
+            db.flush()  # need code_file.id before creating its symbols
+            files_indexed += 1
+
+            # (symbol_id, start_line, end_line) for this file, used below to
+            # work out which symbol each call sits inside.
+            file_symbol_ranges: list[tuple[int, int, int]] = []
+            for symbol in result.symbols:
+                row = CodeSymbol(
+                    file_id=code_file.id,
+                    name=symbol.name,
+                    symbol_type=SymbolType(symbol.symbol_type),
+                    start_line=symbol.start_line,
+                    end_line=symbol.end_line,
+                )
+                db.add(row)
+                db.flush()  # need row.id for the name map and embedding link
+                name_to_symbol_id.setdefault(symbol.name, row.id)
+                file_symbol_ranges.append((row.id, symbol.start_line, symbol.end_line))
+                embedding_texts.append(symbol.source[:2000])
+                embedding_symbol_ids.append(row.id)
+
+            for call in result.calls:
+                caller_id = _innermost_symbol_at(file_symbol_ranges, call.line)
+                if caller_id is not None:
+                    pending_calls.append((caller_id, call.name, EdgeKind.CALL))
+
+            for reference in result.references:
+                caller_id = _innermost_symbol_at(file_symbol_ranges, reference.line)
+                if caller_id is not None:
+                    pending_calls.append((caller_id, reference.name, EdgeKind.REFERENCE))
+
+    logger.info(
+        "[%s] parsed %d/%d files in %.1fs: %d symbols, %d call sites%s",
+        repository.name,
+        files_indexed,
+        files_seen,
+        time.monotonic() - parse_started,
+        len(embedding_symbol_ids),
+        len(pending_calls),
+        f", {files_skipped} unreadable" if files_skipped else "",
+    )
+
+    report("resolving", f"Linking {len(pending_calls)} call sites")
+    calls_found = 0
+    unresolved = 0
+    seen_edges: set[tuple[int, int]] = set()
+    # Calls first, so that when the same pair appears as both a call and a
+    # mere reference, the edge is recorded as the stronger of the two.
+    pending_calls.sort(key=lambda item: 0 if item[2] == EdgeKind.CALL else 1)
+
+    for caller_id, call_name, kind in pending_calls:
+        callee_id = name_to_symbol_id.get(call_name)
+        if callee_id is None:
+            # A library or builtin, or a local variable, rather than
+            # something defined in this repository: nothing to link to.
+            unresolved += 1
+            continue
+        if callee_id == caller_id:
+            continue
+        # A uses B ten times is still one edge in the graph.
+        if (caller_id, callee_id) in seen_edges:
+            continue
+        seen_edges.add((caller_id, callee_id))
+        db.add(SymbolCall(caller_id=caller_id, callee_id=callee_id, kind=kind))
+        calls_found += 1
+
+    db.commit()
+    logger.info(
+        "[%s] resolved %d call edges (%d call sites pointed outside this repository)",
+        repository.name,
+        calls_found,
+        unresolved,
+    )
+
+    if embedding_texts:
+        logger.info("[%s] embedding %d symbols...", repository.name, len(embedding_texts))
+        embed_started = time.monotonic()
+
+        def embedding_progress(done: int, total: int) -> None:
+            report("embedding", f"Embedded {done} of {total} symbols", done, total)
+
+        report("embedding", f"Embedded 0 of {len(embedding_texts)} symbols", 0, len(embedding_texts))
+        vectors = embed_texts(embedding_texts, on_progress=embedding_progress)
+        report("storing", f"Storing {len(vectors)} vectors")
+        points = [
+            (symbol_id, vector, {"repository_id": repository.id, "symbol_id": symbol_id})
+            for symbol_id, vector in zip(embedding_symbol_ids, vectors)
+        ]
+        upsert_symbol_vectors(points)
+
+        for symbol_id in embedding_symbol_ids:
+            db.query(CodeSymbol).filter(CodeSymbol.id == symbol_id).update(
+                {"qdrant_point_id": str(symbol_id)}
+            )
+        db.commit()
+        logger.info(
+            "[%s] embedded and stored %d vectors in %.1fs",
+            repository.name,
+            len(vectors),
+            time.monotonic() - embed_started,
+        )
+    else:
+        logger.info("[%s] no symbols found, nothing to embed", repository.name)
+
+    logger.info(
+        "[%s] finished in %.1fs: %d files, %d symbols, %d call edges",
+        repository.name,
+        time.monotonic() - started,
+        files_indexed,
+        len(embedding_symbol_ids),
+        calls_found,
+    )
+
+    return IndexResult(
+        files_indexed=files_indexed,
+        symbols_found=len(embedding_symbol_ids),
+        calls_found=calls_found,
+    )
+
+
+def _innermost_symbol_at(
+    symbol_ranges: list[tuple[int, int, int]], line: int
+) -> int | None:
+    """
+    Which symbol does this line belong to? A method inside a class sits
+    inside both, so the narrowest range wins: a call in a method is the
+    method's call, not the whole class's.
+    """
+    best_id: int | None = None
+    best_span: int | None = None
+    for symbol_id, start_line, end_line in symbol_ranges:
+        if start_line <= line <= end_line:
+            span = end_line - start_line
+            if best_span is None or span < best_span:
+                best_id, best_span = symbol_id, span
+    return best_id
+
+
+def _clear_existing_index(repository_id: int, db: Session) -> None:
+    """Re-indexing (after new commits, or just retrying) should replace the
+    old index, not append to it."""
+    file_ids = [row[0] for row in db.query(CodeFile.id).filter(CodeFile.repository_id == repository_id).all()]
+    if file_ids:
+        symbol_ids = [
+            row[0] for row in db.query(CodeSymbol.id).filter(CodeSymbol.file_id.in_(file_ids)).all()
+        ]
+        if symbol_ids:
+            db.query(SymbolCall).filter(
+                SymbolCall.caller_id.in_(symbol_ids) | SymbolCall.callee_id.in_(symbol_ids)
+            ).delete(synchronize_session=False)
+            db.query(CodeSymbol).filter(CodeSymbol.id.in_(symbol_ids)).delete(synchronize_session=False)
+        db.query(CodeFile).filter(CodeFile.id.in_(file_ids)).delete(synchronize_session=False)
+    db.commit()
+    delete_repository_vectors(repository_id)

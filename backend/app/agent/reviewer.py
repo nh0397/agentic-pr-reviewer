@@ -85,26 +85,62 @@ class ReviewResult:
     raw_response: str | None = None
 
 
-def _format_diff(pull_request: dict[str, Any], max_patch_chars: int = 6000) -> str:
+def _format_diff(
+    pull_request: dict[str, Any],
+    max_patch_chars: int = 6000,
+    max_total_chars: int = 40000,
+) -> str:
+    """
+    A per-file cap alone is not enough: fifty files at six thousand
+    characters each would be a three hundred thousand character prompt. So
+    there is an overall budget too, and the full file list is always shown
+    even when the patches stop, so the agent knows what it has not seen and
+    can go read those files with its tools.
+    """
+    changed_files = pull_request["changed_files"]
     lines = [
         f"PR #{pull_request['number']}: {pull_request['title']}",
-        f"Author: {pull_request.get('author')}   {pull_request.get('base_ref')} <- {pull_request.get('head_ref')}",
+        f"Author: {pull_request.get('author')}   "
+        f"{pull_request.get('base_ref')} <- {pull_request.get('head_ref')}",
     ]
     if pull_request.get("body"):
         lines.append(f"\nDescription:\n{pull_request['body'][:1500]}")
 
-    lines.append(f"\nChanged files ({len(pull_request['changed_files'])}):")
-    for changed in pull_request["changed_files"]:
+    lines.append(f"\nChanged files ({len(changed_files)}):")
+    for changed in changed_files:
         lines.append(
-            f"\n--- {changed['path']} ({changed['status']}, "
+            f"  {changed['path']} ({changed['status']}, "
             f"+{changed['additions']}/-{changed['deletions']})"
         )
+
+    # Smallest diffs first, so a budget spent on one enormous generated file
+    # does not crowd out a dozen small, meaningful ones.
+    by_size = sorted(changed_files, key=lambda f: len(f.get("patch") or ""))
+
+    lines.append("\nPatches:")
+    used = 0
+    omitted: list[str] = []
+    for changed in by_size:
         patch = changed.get("patch")
-        if patch:
-            lines.append(patch[:max_patch_chars])
-        else:
+        if not patch:
             # Binary files and very large diffs come back without a patch.
-            lines.append("(no patch available)")
+            omitted.append(changed["path"])
+            continue
+        snippet = patch[:max_patch_chars]
+        if used + len(snippet) > max_total_chars:
+            omitted.append(changed["path"])
+            continue
+        lines.append(f"\n--- {changed['path']}")
+        lines.append(snippet)
+        if len(patch) > len(snippet):
+            lines.append(f"... (patch truncated, {len(patch) - len(snippet)} more characters)")
+        used += len(snippet)
+
+    if omitted:
+        lines.append(
+            "\nPatches not shown for these files (use read_file if you need them): "
+            + ", ".join(omitted)
+        )
     return "\n".join(lines)
 
 

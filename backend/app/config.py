@@ -28,7 +28,14 @@ class Settings(BaseSettings):
     # so adding those features later is a config read, not a new settings class.
     qdrant_url: str | None = None
     qdrant_api_key: str | None = None
+
     groq_api_key: str | None = None
+    # Which model the review agent runs on. Kept in config because the
+    # free tier's available models change over time.
+    llm_model: str = "openai/gpt-oss-120b"
+    # Ceiling on tool-calling rounds in one review. Without it a model that
+    # keeps asking for tools would loop until the rate limit stops it.
+    agent_max_steps: int = 12
 
 
 @lru_cache
